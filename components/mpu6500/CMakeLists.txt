@@ -1,0 +1,12 @@
+idf_component_register(
+    SRCS 
+        "driver_mpu6500.c"
+        "driver_mpu6500_basic.c"
+        "driver_mpu6500_interface.c"
+    INCLUDE_DIRS 
+        "."
+    REQUIRES 
+        driver 
+        freertos 
+        esp_timer
+)
