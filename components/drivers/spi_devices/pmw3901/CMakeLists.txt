@@ -1,3 +1,8 @@
-idf_component_register(SRCS "flowdeck_v1v2.c" "pmw3901.c"
-                       INCLUDE_DIRS "include"
-                       REQUIRES driver freertos)
+idf_component_register(
+    SRCS "pmw3901.c"
+    INCLUDE_DIRS "include"
+    REQUIRES 
+        driver 
+        esp_timer
+        esp_rom
+)

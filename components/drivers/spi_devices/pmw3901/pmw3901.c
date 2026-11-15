@@ -29,11 +29,14 @@
 #include "freertos/task.h"
 #include "driver/spi_master.h"
 #include "driver/i2c_master.h" // Hoặc "driver/i2c.h" nếu dùng IDF v4.x
-#include "esp_rom_delay.h"     // Cung cấp hàm delay microsecond
+#include "esp_rom_sys.h"       // Cung cấp hàm delay microsecond
 #include "esp_log.h"
 #include "driver/gpio.h"
+#include "pmw3901.h"
 static const char *TAG = "PMW3901";
-
+#ifndef M2T
+#define M2T(ms) pdMS_TO_TICKS(ms)
+#endif
 // --- ÁNH XÁ HÀM NỘI BỘ ---
 #define sleepus(us) esp_rom_delay_us(us)
 #define sleepms(ms) vTaskDelay(pdMS_TO_TICKS(ms))
