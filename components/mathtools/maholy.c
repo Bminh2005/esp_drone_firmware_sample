@@ -1,5 +1,8 @@
 #include <math.h>
+#include "maholy.h"
 
+#define MAHONY_KP MAHONY_DEFAULT_KP                                      // Hệ số P (Tín nhiệm Accel)
+#define MAHONY_KI MAHONY_DEFAULT_KI                                      // Hệ số I (Bù Gyro Drift)
 static float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;                 // Quaternion trạng thái initial
 static float integralFBx = 0.0f, integralFBy = 0.0f, integralFBz = 0.0f; // Tích phân lỗi
 

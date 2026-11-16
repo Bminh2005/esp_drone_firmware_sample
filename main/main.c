@@ -2,29 +2,32 @@
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "esp_timer.h"
 #include "esp_log.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "driver/i2c_master.h"
 
-// Sensor Drivers
+// Sensor Drivers & Math Tools
 #include "pmw3901.h"
 #include "vl53l0x.h"
 #include "driver_mpu6500_basic.h"
+#include "maholy.h"
 
 static const char *TAG = "MAIN_SYSTEM";
 
-// --- CẤU HÌNH BỘ LỌC BÙ & TẦN SỐ MPU6500 ---
-#define ALPHA 0.96f
-#define DT 0.01f // 10ms (100Hz)
+// --- CHUYỂN ĐỔI ĐƠN VỊ ---
 #define RAD_TO_DEG (180.0f / M_PI)
+#define DEG_TO_RAD (M_PI / 180.0f)
 
 // --- CẤU HÌNH CHÂN NỐI PHẦN CỨNG (GPIO PINOUT) ---
 #define I2C_SDA_PIN GPIO_NUM_21
 #define I2C_SCL_PIN GPIO_NUM_22
 #define PMW3901_CS_PIN GPIO_NUM_26
 #define VL53L0X_XSHUT_PIN GPIO_NUM_17
-// --- STRUCT LƯU TRẠNG THÁI MPU6500 ---
+
+// --- STRUCT LƯU TRẠNG THÁI GYRO BIAS ---
 typedef struct
 {
     float x;
@@ -33,15 +36,11 @@ typedef struct
     bool is_calibrated;
 } gyro_bias_t;
 
-typedef struct
-{
-    float roll;
-    float pitch;
-    float yaw;
-} euler_angles_t;
-
 static gyro_bias_t s_gyro_bias = {0};
-static euler_angles_t s_angles = {0};
+
+// --- QUẢN LÝ DỮ LIỆU MAHONY AHRS TOÀN CỤC & MUTEX ---
+static ahrs_state_t g_ahrs_state = {0};
+static SemaphoreHandle_t g_ahrs_mutex = NULL;
 
 // --- HANDLE THIẾT BỊ BUS ---
 i2c_master_bus_handle_t i2c_bus_handle = NULL;
@@ -55,7 +54,6 @@ static void app_spi_init(void)
 {
     esp_err_t ret;
 
-    // KÊNH SPI 3 (SPI3_HOST) - DÀNH CHO PMW3901
     spi_bus_config_t buscfg_pmw = {
         .miso_io_num = GPIO_NUM_33,
         .mosi_io_num = GPIO_NUM_32,
@@ -67,26 +65,24 @@ static void app_spi_init(void)
     ret = spi_bus_initialize(SPI3_HOST, &buscfg_pmw, SPI_DMA_CH_AUTO);
     ESP_ERROR_CHECK(ret);
 
-    // Cấu hình CS điều khiển bằng tay (Software GPIO) cho PMW3901
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << PMW3901_CS_PIN),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
     };
     gpio_config(&io_conf);
-    gpio_set_level(PMW3901_CS_PIN, 1); // Trạng thái nghỉ ban đầu của CS là HIGH
+    gpio_set_level(PMW3901_CS_PIN, 1);
 
     spi_device_interface_config_t devcfg_pmw = {
-        .clock_speed_hz = 2 * 1000 * 1000, // 2 MHz cho PMW3901
-        .mode = 3,                         // SPI Mode 3
-        .spics_io_num = -1,                // Quản lý CS thủ công qua GPIO
+        .clock_speed_hz = 2 * 1000 * 1000,
+        .mode = 3,
+        .spics_io_num = -1,
         .queue_size = 7,
     };
     ret = spi_bus_add_device(SPI3_HOST, &devcfg_pmw, &pmw3901_spi_handle);
     ESP_ERROR_CHECK(ret);
     ESP_LOGI(TAG, "Khoi tao SPI3_HOST cho PMW3901 thanh cong");
 
-    // Delay ngắn để chân CS và Bus SPI3 ổn định mức điện thế
     vTaskDelay(pdMS_TO_TICKS(50));
 }
 
@@ -95,19 +91,18 @@ static void init_i2c_bus(void)
 {
     i2c_master_bus_config_t bus_config = {
         .i2c_port = I2C_NUM_0,
-        .sda_io_num = I2C_SDA_PIN, // GPIO 21
-        .scl_io_num = I2C_SCL_PIN, // GPIO 22
+        .sda_io_num = I2C_SDA_PIN,
+        .scl_io_num = I2C_SCL_PIN,
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .glitch_ignore_cnt = 7,
         .flags.enable_internal_pullup = true,
     };
     ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &i2c_bus_handle));
 
-    // Đổi tốc độ về 100kHz để giao tiếp an toàn và ổn định hơn với pull-up nội
     i2c_device_config_t vl53_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = VL53L0X_DEFAULT_ADDRESS, // 0x29
-        .scl_speed_hz = 100000,                    // 100 kHz
+        .device_address = VL53L0X_DEFAULT_ADDRESS,
+        .scl_speed_hz = 100000,
     };
     ESP_ERROR_CHECK(i2c_master_bus_add_device(i2c_bus_handle, &vl53_cfg, &vl53_dev_handle));
 }
@@ -153,14 +148,14 @@ uint8_t mpu6500_gyro_calibrate(uint16_t sample_count)
     return 0;
 }
 
-// --- TASK ĐỌC VÀ TÍNH TOÁN GÓC IMU (100Hz) ---
+// --- TASK ĐỌC VÀ TÍNH TOÁN GÓC MAHONY AHRS (100Hz) ---
 void mpu6500_read_task(void *pvParameters)
 {
     float accel[3]; /* Ax, Ay, Az (g) */
     float gyro[3];  /* Gx, Gy, Gz (dps) */
     uint8_t res;
 
-    /* 1. Khởi tạo MPU6500 SPI (LibDriver sẽ tự gọi mpu6500_interface_spi_init khởi tạo SPI2_HOST) */
+    /* 1. Khởi tạo MPU6500 SPI */
     res = mpu6500_basic_init(MPU6500_INTERFACE_SPI, MPU6500_ADDRESS_AD0_LOW);
     if (res != 0)
     {
@@ -176,40 +171,57 @@ void mpu6500_read_task(void *pvParameters)
         return;
     }
 
-    /* Đọc mẫu ban đầu để thiết lập góc khởi tạo từ Accel */
-    if (mpu6500_basic_read(accel, gyro) == 0)
-    {
-        s_angles.roll = atan2f(accel[1], accel[2]) * RAD_TO_DEG;
-        s_angles.pitch = atan2f(-accel[0], sqrtf(accel[1] * accel[1] + accel[2] * accel[2])) * RAD_TO_DEG;
-        s_angles.yaw = 0.0f;
-    }
+    /* 3. Khởi tạo thuật toán Mahony AHRS */
+    mahony_init();
 
     TickType_t xLastWakeTime = xTaskGetTickCount();
+    int64_t last_time = esp_timer_get_time();
 
-    /* 3. Vòng lặp tính toán góc (Chu kỳ 10ms = 100Hz) */
+    /* 4. Vòng lặp tính toán góc Mahony AHRS (Chu kỳ 10ms = 100Hz) */
     while (1)
     {
         res = mpu6500_basic_read(accel, gyro);
         if (res == 0)
         {
-            /* Trừ offset cho Gyro */
-            float gx = gyro[0] - s_gyro_bias.x;
-            float gy = gyro[1] - s_gyro_bias.y;
-            float gz = gyro[2] - s_gyro_bias.z;
+            // Tính khoảng dt thực tế chính xác bằng esp_timer
+            int64_t now = esp_timer_get_time();
+            float dt = (float)(now - last_time) / 1000000.0f;
+            last_time = now;
 
-            /* Tính Roll và Pitch từ Accelerometer */
-            float accel_roll = atan2f(accel[1], accel[2]) * RAD_TO_DEG;
-            float accel_pitch = atan2f(-accel[0], sqrtf(accel[1] * accel[1] + accel[2] * accel[2])) * RAD_TO_DEG;
+            if (dt <= 0.0f || dt > 0.1f)
+            {
+                dt = 0.01f; // Chu kỳ mặc định 10ms nếu dt thất thường
+            }
 
-            /* Bộ lọc bù (Complementary Filter) cho Roll & Pitch */
-            s_angles.roll = ALPHA * (s_angles.roll + gx * DT) + (1.0f - ALPHA) * accel_roll;
-            s_angles.pitch = ALPHA * (s_angles.pitch + gy * DT) + (1.0f - ALPHA) * accel_pitch;
+            // Trừ offset và đổi Gyro từ dps -> rad/s (bắt buộc cho Mahony)
+            float gx_raw = (gyro[0] - s_gyro_bias.x) * DEG_TO_RAD;
+            float gy_raw = (gyro[1] - s_gyro_bias.y) * DEG_TO_RAD;
+            float gz_raw = (gyro[2] - s_gyro_bias.z) * DEG_TO_RAD;
 
-            /* Yaw chỉ tích phân từ Gyro Z */
-            s_angles.yaw += gz * DT;
+            // 1. Remap Accel (Giữ chuẩn Right-Handed Coordinate System)
+            float ax_body = accel[1];  // Trục Y IMU làm hướng tiến (+X Body)
+            float ay_body = -accel[0]; // Trục X IMU làm hướng ngang (+Y Body, chú ý dấu ÂM)
+            float az_body = accel[2];  // Trục Z IMU hướng xuống (+Z Body)
+
+            // 2. Remap Gyro đồng bộ 1:1 theo trục Accel
+            float gx_body = gy_raw;  // Gyro Roll theo trục X body (từ Gyro Y IMU)
+            float gy_body = -gx_raw; // Gyro Pitch theo trục Y body (từ Gyro X IMU, đảo dấu)
+            float gz_body = -gz_raw; // Gyro Yaw (Xoay phải -> Yaw tăng)
+
+            // 3. Truyền vào Mahony AHRS
+            ahrs_state_t temp_ahrs;
+            mahony_ahrs_update_6dof(gx_body, gy_body, gz_body,
+                                    ax_body, ay_body, az_body,
+                                    dt, &temp_ahrs);
+            // Ghi dữ liệu an toàn vào biến toàn cục cho task monitor
+            if (xSemaphoreTake(g_ahrs_mutex, pdMS_TO_TICKS(1)) == pdTRUE)
+            {
+                g_ahrs_state = temp_ahrs;
+                xSemaphoreGive(g_ahrs_mutex);
+            }
         }
 
-        /* Đảm bảo vòng lặp chạy đúng định thời 10ms (100Hz) */
+        /* Đảm bảo vòng lặp định thời 10ms (100Hz) */
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(10));
     }
 
@@ -217,25 +229,38 @@ void mpu6500_read_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
-// --- TASK ĐỌC PHỤ & MONITOR CẢM BIẾN (PMW3901 & VL53L0X) ---
+// --- TASK ĐỌC PHỤ & MONITOR CẢM BIẾN (PMW3901, VL53L0X & MAHONY AHRS) ---
 void sensor_monitor_task(void *pvParameters)
 {
     motionBurst_t pmw_motion = {0};
     uint16_t distance_mm = 0;
+    ahrs_state_t local_ahrs = {0};
 
     vl53l0xStartContinuous(&vl53_dev, 0);
 
     while (1)
     {
-        // Đọc PMW3901 Optical Flow
+        // 1. Đọc PMW3901 Optical Flow
         pmw3901ReadMotion(PMW3901_CS_PIN, &pmw_motion);
 
-        // Đọc VL53L0X ToF Distance
+        // 2. Đọc VL53L0X ToF Distance
         distance_mm = vl53l0xReadRangeContinuousMillimeters(&vl53_dev);
 
-        // In tổng hợp dữ liệu toàn bộ hệ thống cảm biến
+        // 3. Đọc dữ liệu tư thế an toàn từ Mutex
+        if (xSemaphoreTake(g_ahrs_mutex, pdMS_TO_TICKS(5)) == pdTRUE)
+        {
+            local_ahrs = g_ahrs_state;
+            xSemaphoreGive(g_ahrs_mutex);
+        }
+
+        // Chuyển đổi góc từ Radian -> Độ (Degree)
+        float roll_deg = local_ahrs.roll * RAD_TO_DEG;
+        float pitch_deg = local_ahrs.pitch * RAD_TO_DEG;
+        float yaw_deg = local_ahrs.yaw * RAD_TO_DEG;
+
+        // 4. In tổng hợp dữ liệu toàn bộ hệ thống cảm biến (GIỮ NGUYÊN FORMAT GỐC FOR VISUALIZATION)
         ESP_LOGI(TAG, "ATTITUDE | Roll: %6.2f | Pitch: %6.2f | Yaw: %6.2f",
-                 s_angles.roll, s_angles.pitch, s_angles.yaw);
+                 roll_deg, pitch_deg, yaw_deg);
         ESP_LOGI(TAG, "OPT_FLOW | Motion: %d | DeltaX: %4d | DeltaY: %4d | SQual: %3d",
                  pmw_motion.motionOccured,
                  pmw_motion.deltaX,
@@ -247,10 +272,9 @@ void sensor_monitor_task(void *pvParameters)
         vTaskDelay(pdMS_TO_TICKS(50)); // In dữ liệu ở chu kỳ 20Hz (50ms)
     }
 }
+
 static void vl53l0x_hard_reset(void)
 {
-    // On common VL53L0X breakout boards, XSHUT is usually pulled up to HIGH with a 10 kΩ resistor.
-    // Drive LOW briefly to force a clean hardware reset before I2C initialization.
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << VL53L0X_XSHUT_PIN),
         .mode = GPIO_MODE_OUTPUT,
@@ -265,10 +289,19 @@ static void vl53l0x_hard_reset(void)
     gpio_set_level(VL53L0X_XSHUT_PIN, 1);
     vTaskDelay(pdMS_TO_TICKS(2));
 }
+
 // --- MAIN ENTRY POINT ---
 void app_main(void)
 {
     ESP_LOGI(TAG, "Initializing System Hardware...");
+
+    // 0. Tạo Mutex bảo vệ dữ liệu AHRS giữa 2 Tasks
+    g_ahrs_mutex = xSemaphoreCreateMutex();
+    if (g_ahrs_mutex == NULL)
+    {
+        ESP_LOGE(TAG, "Khong the tao Mutex AHRS!");
+        return;
+    }
 
     // 1. Khởi tạo Buses
     app_spi_init();
@@ -287,7 +320,7 @@ void app_main(void)
     }
 
     // 4. Khởi tạo VL53L0X
-    vl53l0x_hard_reset(); // Reset phần cứng VL53L0X trước khi khởi tạo I2C
+    vl53l0x_hard_reset();
     init_i2c_bus();
     if (vl53l0xInit(&vl53_dev, vl53_dev_handle, true))
     {

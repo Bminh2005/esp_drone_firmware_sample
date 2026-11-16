@@ -512,7 +512,7 @@
                 // Propeller Blades Disk
                 const propGeo = new THREE.BoxGeometry(0.7, 0.02, 0.08);
                 const propMat = new THREE.MeshStandardMaterial({
-                    color: idx < 2 ? 0x06b6d4 : 0x10b981,
+                    color: (idx === 1 || idx === 2) ? 0x06b6d4 : 0x10b981,
                     transparent: true,
                     opacity: 0.85
                 });

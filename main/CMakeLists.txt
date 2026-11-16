@@ -6,4 +6,5 @@ idf_component_register(
         mpu6500 
         driver 
         esp_timer
+        mathtools
 )
