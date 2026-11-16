@@ -1,0 +1,1073 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 Drone Telemetry HUD & Log Parser</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Three.js for 3D Visualization -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap"
+        rel="stylesheet">
+
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'monospace'],
+                    },
+                    colors: {
+                        hud: {
+                            bg: '#090d16',
+                            card: '#111827',
+                            border: '#1f2937',
+                            accent: '#06b6d4',
+                            green: '#10b981',
+                            yellow: '#f59e0b',
+                            red: '#ef4444',
+                            darkText: '#9ca3af'
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        /* Custom Scrollbar for Log Console */
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #0d1322;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #1f2937;
+            border-radius: 3px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #06b6d4;
+        }
+
+        .hud-grid {
+            background-size: 24px 24px;
+            background-image:
+                linear-gradient(to right, rgba(31, 41, 55, 0.3) 1px, transparent 1px),
+                linear-gradient(to bottom, rgba(31, 41, 55, 0.3) 1px, transparent 1px);
+        }
+
+        .glow-accent {
+            box-shadow: 0 0 15px rgba(6, 182, 212, 0.15);
+        }
+
+        .glow-green {
+            box-shadow: 0 0 15px rgba(16, 185, 129, 0.2);
+        }
+    </style>
+</head>
+
+<body
+    class="bg-[#070a12] text-slate-100 font-sans min-h-screen flex flex-col antialiased selection:bg-cyan-500 selection:text-white">
+
+    <!-- Top Header Bar -->
+    <header
+        class="border-b border-gray-800 bg-[#0d121f]/90 backdrop-blur sticky top-0 z-50 px-4 py-3 flex flex-wrap items-center justify-between gap-4">
+        <div class="flex items-center space-x-3">
+            <div class="p-2 bg-cyan-950/80 border border-cyan-500/40 rounded-lg text-cyan-400 glow-accent">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                        d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"></path>
+                </svg>
+            </div>
+            <div>
+                <h1
+                    class="font-bold text-lg tracking-wide bg-gradient-to-r from-cyan-400 via-teal-300 to-emerald-400 bg-clip-text text-transparent">
+                    ESP-IDF DRONE TELEMETRY HUD
+                </h1>
+                <p class="text-xs text-slate-400 font-mono">Sensors: MPU6500 (SPI) | PMW3901 (SPI) | VL53L0X (I2C)</p>
+            </div>
+        </div>
+
+        <!-- Connection & Source Controls -->
+        <div class="flex flex-wrap items-center gap-2">
+            <!-- Status Badge -->
+            <div id="statusBadge"
+                class="flex items-center space-x-2 px-3 py-1.5 rounded-full text-xs font-mono bg-gray-800/80 border border-gray-700 text-gray-400">
+                <span class="w-2.5 h-2.5 rounded-full bg-gray-500 inline-block animate-pulse" id="statusDot"></span>
+                <span id="statusText">DISCONNECTED</span>
+            </div>
+
+            <!-- Serial Baud Rate Select -->
+            <select id="baudRateSelect"
+                class="bg-gray-900 border border-gray-700 text-slate-200 text-xs rounded-lg px-2.5 py-1.5 focus:border-cyan-500 focus:outline-none font-mono">
+                <option value="115200" selected>115200 Baud</option>
+                <option value="921600">921600 Baud</option>
+                <option value="57600">57600 Baud</option>
+                <option value="9600">9600 Baud</option>
+            </select>
+
+            <!-- Web Serial Button -->
+            <button id="btnConnectSerial"
+                class="px-3.5 py-1.5 rounded-lg text-xs font-medium bg-cyan-600 hover:bg-cyan-500 text-white transition flex items-center space-x-1.5 shadow-md shadow-cyan-950">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                        d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
+                </svg>
+                <span>Connect COM</span>
+            </button>
+
+            <!-- Simulator Toggle Button -->
+            <button id="btnToggleSim"
+                class="px-3.5 py-1.5 rounded-lg text-xs font-medium bg-emerald-600 hover:bg-emerald-500 text-white transition flex items-center space-x-1.5 shadow-md shadow-emerald-950">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                        d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z">
+                    </path>
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                        d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                </svg>
+                <span id="simBtnText">Demo Mode</span>
+            </button>
+
+            <!-- Paste Data Modal Button -->
+            <button id="btnOpenPasteModal"
+                class="px-3.5 py-1.5 rounded-lg text-xs font-medium bg-gray-800 hover:bg-gray-700 text-slate-200 border border-gray-700 transition flex items-center space-x-1.5">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                        d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2">
+                    </path>
+                </svg>
+                <span>Paste Log</span>
+            </button>
+        </div>
+    </header>
+
+    <!-- Main Workspace Container -->
+    <main class="flex-1 p-4 grid grid-cols-1 lg:grid-cols-2 gap-4 max-w-[1920px] mx-auto w-full">
+
+        <!-- PANEL 1: ATTITUDE (MPU6500) & 3D DRONE MODEL -->
+        <section
+            class="bg-[#101625] border border-gray-800 rounded-xl p-4 flex flex-col justify-between shadow-xl relative overflow-hidden hud-grid">
+            <!-- Header -->
+            <div class="flex justify-between items-center mb-2 z-10">
+                <div class="flex items-center space-x-2">
+                    <span class="w-2 h-2 rounded-full bg-cyan-400 shadow-[0_0_8px_#06b6d4]"></span>
+                    <h2 class="font-semibold text-sm tracking-wide text-slate-200">ATTITUDE (MPU6500 SPI)</h2>
+                </div>
+                <div
+                    class="text-xs font-mono text-cyan-400/80 bg-cyan-950/40 px-2 py-0.5 rounded border border-cyan-800/40">
+                    100Hz Task Core 1
+                </div>
+            </div>
+
+            <!-- 3D Canvas Container -->
+            <div
+                class="relative flex-1 min-h-[300px] w-full bg-slate-950/60 rounded-lg border border-gray-800/80 overflow-hidden flex items-center justify-center">
+                <div id="threejsContainer" class="w-full h-full absolute inset-0"></div>
+
+                <!-- Artificial Horizon HUD Overlay -->
+                <canvas id="artificialHorizonCanvas" width="120" height="120"
+                    class="absolute top-3 left-3 rounded-full border border-cyan-500/30 bg-gray-950/70 backdrop-blur pointer-events-none"></canvas>
+
+                <!-- 3D Controls overlay -->
+                <div class="absolute bottom-3 right-3 flex items-center space-x-2 z-10">
+                    <button id="btnResetView"
+                        class="px-2.5 py-1 bg-gray-900/80 hover:bg-gray-800 border border-gray-700 text-xs font-mono text-slate-300 rounded transition backdrop-blur">
+                        Reset Camera
+                    </button>
+                </div>
+            </div>
+
+            <!-- Digital Readout Values -->
+            <div class="grid grid-cols-3 gap-3 mt-3 z-10">
+                <div class="bg-gray-900/80 border border-gray-800 p-2.5 rounded-lg text-center">
+                    <div class="text-[10px] font-mono text-slate-400 uppercase tracking-wider">ROLL</div>
+                    <div class="text-lg font-mono font-bold text-cyan-400 mt-0.5">
+                        <span id="valRoll">0.00</span>°
+                    </div>
+                </div>
+                <div class="bg-gray-900/80 border border-gray-800 p-2.5 rounded-lg text-center">
+                    <div class="text-[10px] font-mono text-slate-400 uppercase tracking-wider">PITCH</div>
+                    <div class="text-lg font-mono font-bold text-teal-400 mt-0.5">
+                        <span id="valPitch">0.00</span>°
+                    </div>
+                </div>
+                <div class="bg-gray-900/80 border border-gray-800 p-2.5 rounded-lg text-center">
+                    <div class="text-[10px] font-mono text-slate-400 uppercase tracking-wider">YAW</div>
+                    <div class="text-lg font-mono font-bold text-emerald-400 mt-0.5">
+                        <span id="valYaw">0.00</span>°
+                    </div>
+                </div>
+            </div>
+        </section>
+
+
+        <!-- PANEL 2: OPTICAL FLOW (PMW3901) -->
+        <section
+            class="bg-[#101625] border border-gray-800 rounded-xl p-4 flex flex-col justify-between shadow-xl relative overflow-hidden hud-grid">
+            <!-- Header -->
+            <div class="flex justify-between items-center mb-2 z-10">
+                <div class="flex items-center space-x-2">
+                    <span class="w-2 h-2 rounded-full bg-emerald-400 shadow-[0_0_8px_#10b981]"></span>
+                    <h2 class="font-semibold text-sm tracking-wide text-slate-200">OPTICAL FLOW MAP (PMW3901 SPI)</h2>
+                </div>
+                <div class="flex items-center space-x-2 font-mono text-xs">
+                    <span id="motionStatusBadge"
+                        class="px-2 py-0.5 rounded bg-gray-800 text-gray-400 border border-gray-700">
+                        MOTION: IDLE
+                    </span>
+                </div>
+            </div>
+
+            <!-- 2D Trajectory Plotter Canvas -->
+            <div
+                class="relative flex-1 min-h-[300px] w-full bg-slate-950/60 rounded-lg border border-gray-800/80 overflow-hidden">
+                <canvas id="optFlowCanvas" class="w-full h-full block"></canvas>
+
+                <div
+                    class="absolute bottom-3 left-3 flex items-center space-x-2 font-mono text-[11px] text-slate-400 bg-gray-950/80 px-2.5 py-1 rounded border border-gray-800">
+                    <span>Pos X: <strong id="valPosX" class="text-emerald-400">0</strong></span>
+                    <span class="text-gray-600">|</span>
+                    <span>Pos Y: <strong id="valPosY" class="text-emerald-400">0</strong></span>
+                </div>
+
+                <div class="absolute top-3 right-3 flex items-center space-x-2 z-10">
+                    <button id="btnClearMap"
+                        class="px-2.5 py-1 bg-gray-900/80 hover:bg-gray-800 border border-gray-700 text-xs font-mono text-slate-300 rounded transition backdrop-blur">
+                        Clear Path
+                    </button>
+                </div>
+            </div>
+
+            <!-- Optical Flow Metrics -->
+            <div class="grid grid-cols-4 gap-2 mt-3 z-10">
+                <div class="bg-gray-900/80 border border-gray-800 p-2 rounded-lg text-center">
+                    <div class="text-[10px] font-mono text-slate-400 uppercase">Delta X</div>
+                    <div class="text-base font-mono font-bold text-slate-200 mt-0.5" id="valDeltaX">0</div>
+                </div>
+                <div class="bg-gray-900/80 border border-gray-800 p-2 rounded-lg text-center">
+                    <div class="text-[10px] font-mono text-slate-400 uppercase">Delta Y</div>
+                    <div class="text-base font-mono font-bold text-slate-200 mt-0.5" id="valDeltaY">0</div>
+                </div>
+                <div class="bg-gray-900/80 border border-gray-800 p-2 rounded-lg text-center">
+                    <div class="text-[10px] font-mono text-slate-400 uppercase">Surface Qual</div>
+                    <div class="text-base font-mono font-bold text-emerald-400 mt-0.5" id="valSQual">255</div>
+                </div>
+                <div class="bg-gray-900/80 border border-gray-800 p-2 rounded-lg flex flex-col justify-center px-3">
+                    <div class="text-[10px] font-mono text-slate-400 uppercase mb-1">Quality Bar</div>
+                    <div class="w-full bg-gray-800 h-2 rounded-full overflow-hidden">
+                        <div id="squalBar" class="bg-emerald-500 h-full w-full transition-all duration-300"></div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+
+        <!-- PANEL 3: ALTITUDE (VL53L0X) -->
+        <section
+            class="bg-[#101625] border border-gray-800 rounded-xl p-4 flex flex-col justify-between shadow-xl relative overflow-hidden hud-grid">
+            <!-- Header -->
+            <div class="flex justify-between items-center mb-2 z-10">
+                <div class="flex items-center space-x-2">
+                    <span class="w-2 h-2 rounded-full bg-amber-400 shadow-[0_0_8px_#f59e0b]"></span>
+                    <h2 class="font-semibold text-sm tracking-wide text-slate-200">ALTITUDE RANGEFINDER (VL53L0X I2C)
+                    </h2>
+                </div>
+                <div
+                    class="text-xs font-mono text-amber-400/80 bg-amber-950/40 px-2 py-0.5 rounded border border-amber-800/40">
+                    Range: 0 - 2000 mm
+                </div>
+            </div>
+
+            <!-- Graph & Dynamic Visual Gauge -->
+            <div class="flex items-center gap-4 flex-1 min-h-[220px]">
+                <!-- Line Chart Canvas -->
+                <div
+                    class="flex-1 h-full min-h-[200px] bg-slate-950/60 rounded-lg border border-gray-800/80 relative overflow-hidden">
+                    <canvas id="altitudeChartCanvas" class="w-full h-full block"></canvas>
+                </div>
+
+                <!-- Vertical Dynamic Distance Gauge Bar -->
+                <div
+                    class="w-12 h-full min-h-[200px] bg-slate-950/80 border border-gray-800 rounded-lg p-1 flex flex-col justify-end items-center relative overflow-hidden">
+                    <div id="altGaugeFill"
+                        class="w-full bg-gradient-to-t from-amber-600 to-yellow-400 rounded transition-all duration-200"
+                        style="height: 5%;"></div>
+                    <div
+                        class="absolute inset-x-0 bottom-2 text-center text-[10px] font-mono font-bold text-white drop-shadow">
+                        <span id="gaugeValText">31</span>mm
+                    </div>
+                </div>
+            </div>
+
+            <!-- Altitude Numeric Summary -->
+            <div class="grid grid-cols-3 gap-3 mt-3 z-10">
+                <div class="bg-gray-900/80 border border-gray-800 p-2.5 rounded-lg text-center">
+                    <div class="text-[10px] font-mono text-slate-400 uppercase">Distance (mm)</div>
+                    <div class="text-xl font-mono font-bold text-amber-400 mt-0.5" id="valDistance">31</div>
+                </div>
+                <div class="bg-gray-900/80 border border-gray-800 p-2.5 rounded-lg text-center">
+                    <div class="text-[10px] font-mono text-slate-400 uppercase">Distance (cm)</div>
+                    <div class="text-xl font-mono font-bold text-slate-200 mt-0.5" id="valDistanceCm">3.1</div>
+                </div>
+                <div class="bg-gray-900/80 border border-gray-800 p-2.5 rounded-lg text-center">
+                    <div class="text-[10px] font-mono text-slate-400 uppercase">Max Height Session</div>
+                    <div class="text-xl font-mono font-bold text-yellow-500 mt-0.5" id="valMaxAlt">31</div>
+                </div>
+            </div>
+        </section>
+
+
+        <!-- PANEL 4: SERIAL CONSOLE & LOG PARSER MONITOR -->
+        <section
+            class="bg-[#101625] border border-gray-800 rounded-xl p-4 flex flex-col justify-between shadow-xl relative">
+            <div class="flex flex-wrap justify-between items-center mb-2 gap-2">
+                <div class="flex items-center space-x-2">
+                    <svg class="w-4 h-4 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z">
+                        </path>
+                    </svg>
+                    <h2 class="font-semibold text-sm tracking-wide text-slate-200">ESP-IDF TERMINAL STREAM</h2>
+                </div>
+
+                <div class="flex items-center space-x-2">
+                    <!-- Filter Buttons -->
+                    <button class="filter-btn px-2 py-0.5 text-[11px] font-mono rounded bg-cyan-600 text-white"
+                        data-filter="ALL">ALL</button>
+                    <button
+                        class="filter-btn px-2 py-0.5 text-[11px] font-mono rounded bg-gray-800 text-slate-400 hover:text-white"
+                        data-filter="ATTITUDE">ATT</button>
+                    <button
+                        class="filter-btn px-2 py-0.5 text-[11px] font-mono rounded bg-gray-800 text-slate-400 hover:text-white"
+                        data-filter="OPT_FLOW">FLOW</button>
+                    <button
+                        class="filter-btn px-2 py-0.5 text-[11px] font-mono rounded bg-gray-800 text-slate-400 hover:text-white"
+                        data-filter="ALTITUDE">ALT</button>
+
+                    <button id="btnClearConsole" class="p-1 text-slate-400 hover:text-red-400 transition ml-2"
+                        title="Clear Console">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16">
+                            </path>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Terminal Window -->
+            <div id="consoleContainer"
+                class="flex-1 min-h-[220px] max-h-[280px] bg-slate-950 rounded-lg border border-gray-800 p-3 font-mono text-xs overflow-y-auto space-y-1">
+                <div class="text-gray-500 italic">[SYSTEM READY] Awaiting UART log stream or simulation input...</div>
+            </div>
+
+            <!-- Manual Log Tester Input -->
+            <div class="mt-3 flex items-center space-x-2">
+                <input type="text" id="manualLogInput"
+                    placeholder="Paste single log string e.g., ATTITUDE | Roll: 5.2 | Pitch: -1.0 | Yaw: 45.0"
+                    class="flex-1 bg-slate-950 border border-gray-800 rounded-lg px-3 py-1.5 text-xs font-mono text-slate-200 focus:outline-none focus:border-cyan-500">
+                <button id="btnSendManualLog"
+                    class="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-xs font-mono text-cyan-400 border border-gray-700 rounded-lg transition">
+                    Parse
+                </button>
+            </div>
+        </section>
+
+    </main>
+
+    <!-- Paste Log Drawer / Modal -->
+    <div id="pasteModal"
+        class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+        <div class="bg-[#101625] border border-gray-800 rounded-xl w-full max-w-2xl p-5 shadow-2xl space-y-4">
+            <div class="flex justify-between items-center">
+                <h3 class="font-bold text-base text-slate-200 flex items-center space-x-2">
+                    <span>Batch Log Parser</span>
+                </h3>
+                <button id="btnClosePasteModal" class="text-slate-400 hover:text-white">✕</button>
+            </div>
+            <p class="text-xs text-slate-400 font-mono">Paste raw ESP32 serial output logs below. Multiple lines will be
+                processed sequentially.</p>
+            <textarea id="pasteLogArea" rows="8"
+                class="w-full bg-slate-950 border border-gray-800 rounded-lg p-3 font-mono text-xs text-cyan-300 focus:outline-none focus:border-cyan-500"
+                placeholder="I (63917) MAIN_SYSTEM: ATTITUDE | Roll: 2.10 | Pitch: -1.50 | Yaw: 12.00&#10;I (63917) MAIN_SYSTEM: OPT_FLOW | Motion: 1 | DeltaX: 3 | DeltaY: -2 | SQual: 240&#10;I (63920) MAIN_SYSTEM: ALTITUDE | Distance: 150 mm"></textarea>
+            <div class="flex justify-end space-x-2">
+                <button id="btnProcessBatchLog"
+                    class="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold rounded-lg transition">Process
+                    Logs</button>
+            </div>
+        </div>
+    </div>
+
+
+    <!-- JAVASCRIPT APP ENGINE -->
+    <script>
+        // ==========================================
+        // GLOBAL STATE & DATA STRUCTURES
+        // ==========================================
+        const state = {
+            attitude: { roll: 0, pitch: 0, yaw: 0 },
+            optFlow: { motion: 0, deltaX: 0, deltaY: 0, squal: 255, posX: 0, posY: 0, path: [] },
+            altitude: { distance: 31, max: 31, history: [] },
+            connection: 'DISCONNECTED', // 'DISCONNECTED', 'SERIAL', 'SIMULATOR'
+            filter: 'ALL',
+            maxHistoryPoints: 100
+        };
+
+        // Initialize historical arrays
+        for (let i = 0; i < 60; i++) state.altitude.history.push(31);
+
+        // ==========================================
+        // 1. THREE.JS 3D QUADCOPTER VISUALIZER
+        // ==========================================
+        let scene, camera, renderer, droneGroup, propellers = [];
+
+        function initThreeJS() {
+            const container = document.getElementById('threejsContainer');
+            const width = container.clientWidth;
+            const height = container.clientHeight;
+
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x070a12, 0.05);
+
+            camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 1000);
+            camera.position.set(0, 4, 7);
+            camera.lookAt(0, 0, 0);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(width, height);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            container.appendChild(renderer.domElement);
+
+            // Lighting
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.7);
+            scene.add(ambientLight);
+
+            const dirLight = new THREE.DirectionalLight(0x06b6d4, 1.2);
+            dirLight.position.set(5, 10, 7);
+            scene.add(dirLight);
+
+            // Ground Grid Helper
+            const gridHelper = new THREE.GridHelper(20, 20, 0x06b6d4, 0x1f2937);
+            gridHelper.position.y = -1.5;
+            scene.add(gridHelper);
+
+            // --- BUILD 3D DRONE ---
+            droneGroup = new THREE.Group();
+
+            // Central Body
+            const bodyGeo = new THREE.BoxGeometry(0.8, 0.25, 0.8);
+            const bodyMat = new THREE.MeshStandardMaterial({ color: 0x1f2937, metalness: 0.8, roughness: 0.2 });
+            const bodyMesh = new THREE.Mesh(bodyGeo, bodyMat);
+            droneGroup.add(bodyMesh);
+
+            // Top Cap (Flight Controller LED module)
+            const capGeo = new THREE.CylinderGeometry(0.25, 0.3, 0.1, 16);
+            const capMat = new THREE.MeshStandardMaterial({ color: 0x06b6d4, emissive: 0x06b6d4, emissiveIntensity: 0.5 });
+            const capMesh = new THREE.Mesh(capGeo, capMat);
+            capMesh.position.y = 0.18;
+            droneGroup.add(capMesh);
+
+            // Front Nose Indicator Arrow / Spheres
+            const noseGeo = new THREE.SphereGeometry(0.1, 16, 16);
+            const noseMat = new THREE.MeshBasicMaterial({ color: 0xef4444 });
+            const noseMesh = new THREE.Mesh(noseGeo, noseMat);
+            noseMesh.position.set(0, 0, -0.45);
+            droneGroup.add(noseMesh);
+
+            // 4 Arms & Rotors (X-Configuration)
+            const armAngles = [Math.PI / 4, (3 * Math.PI) / 4, (5 * Math.PI) / 4, (7 * Math.PI) / 4];
+            const armLength = 1.4;
+
+            armAngles.forEach((angle, idx) => {
+                const armGroup = new THREE.Group();
+                armGroup.rotation.y = angle;
+
+                // Carbon arm bar
+                const barGeo = new THREE.BoxGeometry(0.1, 0.08, armLength);
+                const barMat = new THREE.MeshStandardMaterial({ color: 0x111827 });
+                const barMesh = new THREE.Mesh(barGeo, barMat);
+                barMesh.position.z = armLength / 2;
+                armGroup.add(barMesh);
+
+                // Motor Base
+                const motorGeo = new THREE.CylinderGeometry(0.12, 0.12, 0.18, 16);
+                const motorMat = new THREE.MeshStandardMaterial({ color: 0x4b5563, metalness: 0.9 });
+                const motorMesh = new THREE.Mesh(motorGeo, motorMat);
+                motorMesh.position.set(0, 0.1, armLength);
+                armGroup.add(motorMesh);
+
+                // Propeller Blades Disk
+                const propGeo = new THREE.BoxGeometry(0.7, 0.02, 0.08);
+                const propMat = new THREE.MeshStandardMaterial({
+                    color: idx < 2 ? 0x06b6d4 : 0x10b981,
+                    transparent: true,
+                    opacity: 0.85
+                });
+                const propMesh = new THREE.Mesh(propGeo, propMat);
+                propMesh.position.set(0, 0.2, armLength);
+                armGroup.add(propMesh);
+
+                propellers.push(propMesh);
+                droneGroup.add(armGroup);
+            });
+
+            scene.add(droneGroup);
+
+            // Resize listener
+            window.addEventListener('resize', () => {
+                if (!container) return;
+                const w = container.clientWidth;
+                const h = container.clientHeight;
+                camera.aspect = w / h;
+                camera.updateProjectionMatrix();
+                renderer.setSize(w, h);
+            });
+        }
+
+        function animateThreeJS() {
+            requestAnimationFrame(animateThreeJS);
+
+            // Rotate props
+            propellers.forEach(prop => {
+                prop.rotation.y += 0.35;
+            });
+
+            // Smooth Interpolation (lerp) towards target attitude
+            if (droneGroup) {
+                // Convert deg to rad
+                const targetRoll = (state.attitude.roll * Math.PI) / 180;
+                const targetPitch = (state.attitude.pitch * Math.PI) / 180;
+                const targetYaw = (state.attitude.yaw * Math.PI) / 180;
+
+                // Aircraft principal axes rotation order
+                droneGroup.rotation.z = THREE.MathUtils.lerp(droneGroup.rotation.z, -targetRoll, 0.15);
+                droneGroup.rotation.x = THREE.MathUtils.lerp(droneGroup.rotation.x, targetPitch, 0.15);
+                droneGroup.rotation.y = THREE.MathUtils.lerp(droneGroup.rotation.y, -targetYaw, 0.15);
+            }
+
+            renderer.render(scene, camera);
+            drawArtificialHorizon();
+        }
+
+        // 2D Artificial Horizon Canvas HUD
+        function drawArtificialHorizon() {
+            const canvas = document.getElementById('artificialHorizonCanvas');
+            const ctx = canvas.getContext('2d');
+            const w = canvas.width;
+            const h = canvas.height;
+            const cx = w / 2;
+            const cy = h / 2;
+
+            ctx.clearRect(0, 0, w, h);
+
+            ctx.save();
+            ctx.translate(cx, cy);
+            ctx.rotate((-state.attitude.roll * Math.PI) / 180);
+
+            // Sky & Ground fill
+            const pitchOffset = state.attitude.pitch * 1.2;
+
+            ctx.fillStyle = '#0284c7'; // Sky Blue
+            ctx.beginPath();
+            ctx.arc(0, 0, w / 2 - 2, Math.PI, 0, false);
+            ctx.fill();
+
+            ctx.fillStyle = '#78350f'; // Ground Brown
+            ctx.beginPath();
+            ctx.arc(0, 0, w / 2 - 2, 0, Math.PI, false);
+            ctx.fill();
+
+            // Pitch Horizon Line
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(-w / 2, pitchOffset);
+            ctx.lineTo(w / 2, pitchOffset);
+            ctx.stroke();
+
+            ctx.restore();
+
+            // Fixed Center Reticle
+            ctx.strokeStyle = '#10b981';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(cx - 15, cy);
+            ctx.lineTo(cx - 5, cy);
+            ctx.moveTo(cx + 5, cy);
+            ctx.lineTo(cx + 15, cy);
+            ctx.moveTo(cx, cy - 5);
+            ctx.lineTo(cx, cy + 5);
+            ctx.stroke();
+        }
+
+        // ==========================================
+        // 2. OPTICAL FLOW 2D MAP CANVAS
+        // ==========================================
+        function drawOptFlowMap() {
+            const canvas = document.getElementById('optFlowCanvas');
+            if (!canvas) return;
+            const rect = canvas.getBoundingClientRect();
+            canvas.width = rect.width;
+            canvas.height = rect.height;
+
+            const ctx = canvas.getContext('2d');
+            const w = canvas.width;
+            const h = canvas.height;
+            const cx = w / 2;
+            const cy = h / 2;
+
+            ctx.clearRect(0, 0, w, h);
+
+            // Radar Background Grid
+            ctx.strokeStyle = 'rgba(31, 41, 55, 0.6)';
+            ctx.lineWidth = 1;
+
+            ctx.beginPath();
+            ctx.arc(cx, cy, 40, 0, Math.PI * 2);
+            ctx.arc(cx, cy, 80, 0, Math.PI * 2);
+            ctx.arc(cx, cy, 120, 0, Math.PI * 2);
+            ctx.stroke();
+
+            ctx.beginPath();
+            ctx.moveTo(cx, 0); ctx.lineTo(cx, h);
+            ctx.moveTo(0, cy); ctx.lineTo(w, cy);
+            ctx.stroke();
+
+            // Draw Path Trail
+            if (state.optFlow.path.length > 1) {
+                ctx.beginPath();
+                ctx.strokeStyle = '#10b981';
+                ctx.lineWidth = 2;
+                state.optFlow.path.forEach((pt, i) => {
+                    const mapX = cx + pt.x * 2;
+                    const mapY = cy + pt.y * 2;
+                    if (i === 0) ctx.moveTo(mapX, mapY);
+                    else ctx.lineTo(mapX, mapY);
+                });
+                ctx.stroke();
+            }
+
+            // Draw Current Position Point
+            const curX = cx + state.optFlow.posX * 2;
+            const curY = cy + state.optFlow.posY * 2;
+
+            ctx.fillStyle = '#06b6d4';
+            ctx.beginPath();
+            ctx.arc(curX, curY, 5, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Glowing Outer Ring
+            ctx.strokeStyle = '#06b6d4';
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.arc(curX, curY, 9, 0, Math.PI * 2);
+            ctx.stroke();
+        }
+
+        // ==========================================
+        // 3. ALTITUDE CHART CANVAS
+        // ==========================================
+        function drawAltitudeChart() {
+            const canvas = document.getElementById('altitudeChartCanvas');
+            if (!canvas) return;
+            const rect = canvas.getBoundingClientRect();
+            canvas.width = rect.width;
+            canvas.height = rect.height;
+
+            const ctx = canvas.getContext('2d');
+            const w = canvas.width;
+            const h = canvas.height;
+            const data = state.altitude.history;
+
+            ctx.clearRect(0, 0, w, h);
+
+            // Grid lines
+            ctx.strokeStyle = 'rgba(31, 41, 55, 0.4)';
+            ctx.lineWidth = 1;
+            for (let y = 0; y < h; y += 30) {
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(w, y);
+                ctx.stroke();
+            }
+
+            if (data.length < 2) return;
+
+            const maxVal = Math.max(200, state.altitude.max * 1.2);
+            const stepX = w / (data.length - 1);
+
+            // Draw Filled Gradient Line
+            ctx.beginPath();
+            data.forEach((val, i) => {
+                const x = i * stepX;
+                const y = h - (val / maxVal) * (h - 20) - 10;
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            });
+
+            // Gradient Fill
+            const gradient = ctx.createLinearGradient(0, 0, 0, h);
+            gradient.addColorStop(0, 'rgba(245, 158, 11, 0.3)');
+            gradient.addColorStop(1, 'rgba(245, 158, 11, 0.0)');
+
+            ctx.lineTo(w, h);
+            ctx.lineTo(0, h);
+            ctx.closePath();
+            ctx.fillStyle = gradient;
+            ctx.fill();
+
+            // Stroke Line
+            ctx.beginPath();
+            data.forEach((val, i) => {
+                const x = i * stepX;
+                const y = h - (val / maxVal) * (h - 20) - 10;
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            });
+            ctx.strokeStyle = '#f59e0b';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+        }
+
+
+        // ==========================================
+        // 4. PARSER ENGINE FOR ESP-IDF LOGS
+        // ==========================================
+        function parseLogLine(line) {
+            if (!line || typeof line !== 'string') return;
+            const trimmed = line.trim();
+            if (trimmed.length === 0) return;
+
+            // 1. ATTITUDE REGEX
+            // Sample: I (63917) MAIN_SYSTEM: ATTITUDE | Roll:   0.00 | Pitch:   0.00 | Yaw:   0.00
+            const attMatch = trimmed.match(/ATTITUDE\s*\|\s*Roll:\s*([-\d.]+)\s*\|\s*Pitch:\s*([-\d.]+)\s*\|\s*Yaw:\s*([-\d.]+)/i);
+            if (attMatch) {
+                const roll = parseFloat(attMatch[1]);
+                const pitch = parseFloat(attMatch[2]);
+                const yaw = parseFloat(attMatch[3]);
+
+                state.attitude.roll = roll;
+                state.attitude.pitch = pitch;
+                state.attitude.yaw = yaw;
+
+                updateAttitudeUI();
+                addConsoleEntry('ATTITUDE', trimmed);
+                return;
+            }
+
+            // 2. OPTICAL FLOW REGEX
+            // Sample: I (63917) MAIN_SYSTEM: OPT_FLOW | Motion: 1 | DeltaX:   -1 | DeltaY:   -1 | SQual: 255
+            const flowMatch = trimmed.match(/OPT_FLOW\s*\|\s*Motion:\s*(\d+)\s*\|\s*DeltaX:\s*([-\d.]+)\s*\|\s*DeltaY:\s*([-\d.]+)\s*\|\s*SQual:\s*(\d+)/i);
+            if (flowMatch) {
+                const motion = parseInt(flowMatch[1], 10);
+                const deltaX = parseFloat(flowMatch[2]);
+                const deltaY = parseFloat(flowMatch[3]);
+                const squal = parseInt(flowMatch[4], 10);
+
+                state.optFlow.motion = motion;
+                state.optFlow.deltaX = deltaX;
+                state.optFlow.deltaY = deltaY;
+                state.optFlow.squal = squal;
+
+                // Accumulate trajectory
+                state.optFlow.posX += deltaX;
+                state.optFlow.posY += deltaY;
+                state.optFlow.path.push({ x: state.optFlow.posX, y: state.optFlow.posY });
+                if (state.optFlow.path.length > 200) state.optFlow.path.shift();
+
+                updateOptFlowUI();
+                drawOptFlowMap();
+                addConsoleEntry('OPT_FLOW', trimmed);
+                return;
+            }
+
+            // 3. ALTITUDE REGEX
+            // Sample: I (63920) MAIN_SYSTEM: ALTITUDE | Distance:   31 mm
+            const altMatch = trimmed.match(/ALTITUDE\s*\|\s*Distance:\s*([-\d.]+)\s*mm/i);
+            if (altMatch) {
+                const dist = parseFloat(altMatch[1]);
+                state.altitude.distance = dist;
+                if (dist > state.altitude.max) state.altitude.max = dist;
+
+                state.altitude.history.push(dist);
+                if (state.altitude.history.length > state.maxHistoryPoints) state.altitude.history.shift();
+
+                updateAltitudeUI();
+                drawAltitudeChart();
+                addConsoleEntry('ALTITUDE', trimmed);
+                return;
+            }
+
+            // Generic Unrecognized Log Line
+            addConsoleEntry('OTHER', trimmed);
+        }
+
+        // ==========================================
+        // UI UPDATE FUNCTIONS
+        // ==========================================
+        function updateAttitudeUI() {
+            document.getElementById('valRoll').textContent = state.attitude.roll.toFixed(2);
+            document.getElementById('valPitch').textContent = state.attitude.pitch.toFixed(2);
+            document.getElementById('valYaw').textContent = state.attitude.yaw.toFixed(2);
+        }
+
+        function updateOptFlowUI() {
+            document.getElementById('valDeltaX').textContent = state.optFlow.deltaX;
+            document.getElementById('valDeltaY').textContent = state.optFlow.deltaY;
+            document.getElementById('valSQual').textContent = state.optFlow.squal;
+            document.getElementById('valPosX').textContent = Math.round(state.optFlow.posX);
+            document.getElementById('valPosY').textContent = Math.round(state.optFlow.posY);
+
+            // SQual Quality Bar
+            const bar = document.getElementById('squalBar');
+            const pct = Math.min(100, Math.max(0, (state.optFlow.squal / 255) * 100));
+            bar.style.width = pct + '%';
+            if (pct < 30) bar.className = 'bg-red-500 h-full transition-all duration-300';
+            else if (pct < 65) bar.className = 'bg-yellow-500 h-full transition-all duration-300';
+            else bar.className = 'bg-emerald-500 h-full transition-all duration-300';
+
+            // Motion Status Badge
+            const badge = document.getElementById('motionStatusBadge');
+            if (state.optFlow.motion === 1) {
+                badge.textContent = 'MOTION: ACTIVE';
+                badge.className = 'px-2 py-0.5 rounded bg-emerald-950 text-emerald-400 border border-emerald-800 animate-pulse';
+            } else {
+                badge.textContent = 'MOTION: IDLE';
+                badge.className = 'px-2 py-0.5 rounded bg-gray-800 text-gray-400 border border-gray-700';
+            }
+        }
+
+        function updateAltitudeUI() {
+            const dist = state.altitude.distance;
+            document.getElementById('valDistance').textContent = Math.round(dist);
+            document.getElementById('valDistanceCm').textContent = (dist / 10).toFixed(1);
+            document.getElementById('valMaxAlt').textContent = Math.round(state.altitude.max);
+            document.getElementById('gaugeValText').textContent = Math.round(dist);
+
+            // Vertical Bar Fill (Range 0-2000mm)
+            const gaugePct = Math.min(100, Math.max(5, (dist / 1000) * 100));
+            document.getElementById('altGaugeFill').style.height = gaugePct + '%';
+        }
+
+        function addConsoleEntry(type, text) {
+            const container = document.getElementById('consoleContainer');
+            if (!container) return;
+
+            // Apply Filters
+            if (state.filter !== 'ALL' && state.filter !== type) return;
+
+            const entry = document.createElement('div');
+            entry.className = 'py-0.5 break-all border-b border-gray-900/50';
+
+            if (type === 'ATTITUDE') {
+                entry.innerHTML = `<span class="text-cyan-400 font-bold">[ATT]</span> <span class="text-cyan-200">${escapeHtml(text)}</span>`;
+            } else if (type === 'OPT_FLOW') {
+                entry.innerHTML = `<span class="text-emerald-400 font-bold">[FLOW]</span> <span class="text-emerald-200">${escapeHtml(text)}</span>`;
+            } else if (type === 'ALTITUDE') {
+                entry.innerHTML = `<span class="text-amber-400 font-bold">[ALT]</span> <span class="text-amber-200">${escapeHtml(text)}</span>`;
+            } else {
+                entry.innerHTML = `<span class="text-gray-500">[LOG]</span> <span class="text-gray-400">${escapeHtml(text)}</span>`;
+            }
+
+            container.appendChild(entry);
+
+            // Auto-scroll to bottom
+            if (container.children.length > 200) {
+                container.removeChild(container.firstChild);
+            }
+            container.scrollTop = container.scrollHeight;
+        }
+
+        function escapeHtml(str) {
+            return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        }
+
+        // ==========================================
+        // 5. INPUT SOURCES: SIMULATOR & WEB SERIAL
+        // ==========================================
+        let simInterval = null;
+
+        function toggleSimulator() {
+            const btnText = document.getElementById('simBtnText');
+            if (state.connection === 'SIMULATOR') {
+                // Stop Simulator
+                clearInterval(simInterval);
+                simInterval = null;
+                state.connection = 'DISCONNECTED';
+                btnText.textContent = 'Demo Mode';
+                updateStatusBadge('DISCONNECTED', 'gray');
+            } else {
+                // Start Simulator
+                state.connection = 'SIMULATOR';
+                btnText.textContent = 'Stop Demo';
+                updateStatusBadge('SIMULATING (LIVE)', 'emerald');
+
+                let tick = 0;
+                simInterval = setInterval(() => {
+                    tick += 0.05;
+                    const roll = (Math.sin(tick * 2) * 15).toFixed(2);
+                    const pitch = (Math.cos(tick * 1.5) * 12).toFixed(2);
+                    const yaw = ((tick * 10) % 360).toFixed(2);
+
+                    const dx = Math.round(Math.sin(tick * 3) * 4);
+                    const dy = Math.round(Math.cos(tick * 3) * 4);
+                    const motion = (Math.abs(dx) > 0 || Math.abs(dy) > 0) ? 1 : 0;
+                    const squal = Math.floor(220 + Math.random() * 35);
+                    const dist = Math.round(150 + Math.sin(tick) * 120 + Math.random() * 5);
+
+                    const timestamp = 63900 + Math.floor(tick * 100);
+
+                    // Push simulated telemetry logs
+                    parseLogLine(`I (${timestamp}) MAIN_SYSTEM: ATTITUDE | Roll: ${roll} | Pitch: ${pitch} | Yaw: ${yaw}`);
+                    if (Math.floor(tick * 10) % 2 === 0) {
+                        parseLogLine(`I (${timestamp}) MAIN_SYSTEM: OPT_FLOW | Motion: ${motion} | DeltaX: ${dx} | DeltaY: ${dy} | SQual: ${squal}`);
+                        parseLogLine(`I (${timestamp}) MAIN_SYSTEM: ALTITUDE | Distance: ${dist} mm`);
+                    }
+                }, 50); // 20Hz updates
+            }
+        }
+
+        // Web Serial API Connection
+        let port, reader;
+        async function connectSerial() {
+            if (!('serial' in navigator)) {
+                alert('Web Serial API is not supported in this browser. Please use Chrome, Edge, or Opera.');
+                return;
+            }
+
+            try {
+                port = await navigator.serial.requestPort();
+                const baudRate = parseInt(document.getElementById('baudRateSelect').value, 10);
+                await port.open({ baudRate });
+
+                state.connection = 'SERIAL';
+                updateStatusBadge('CONNECTED (UART)', 'cyan');
+
+                const textDecoder = new TextDecoderStream();
+                const readableStreamClosed = port.readable.pipeTo(textDecoder.writable);
+                reader = textDecoder.readable.getReader();
+
+                let buffer = '';
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+
+                    buffer += value;
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop(); // Keep incomplete trailing line
+
+                    lines.forEach(line => parseLogLine(line));
+                }
+            } catch (err) {
+                console.error('Serial Error:', err);
+                state.connection = 'DISCONNECTED';
+                updateStatusBadge('SERIAL ERROR', 'red');
+            }
+        }
+
+        function updateStatusBadge(text, color) {
+            const statusText = document.getElementById('statusText');
+            const statusDot = document.getElementById('statusDot');
+            const statusBadge = document.getElementById('statusBadge');
+
+            statusText.textContent = text;
+            if (color === 'emerald') {
+                statusDot.className = 'w-2.5 h-2.5 rounded-full bg-emerald-400 inline-block animate-pulse';
+                statusBadge.className = 'flex items-center space-x-2 px-3 py-1.5 rounded-full text-xs font-mono bg-emerald-950/80 border border-emerald-700 text-emerald-300';
+            } else if (color === 'cyan') {
+                statusDot.className = 'w-2.5 h-2.5 rounded-full bg-cyan-400 inline-block animate-pulse';
+                statusBadge.className = 'flex items-center space-x-2 px-3 py-1.5 rounded-full text-xs font-mono bg-cyan-950/80 border border-cyan-700 text-cyan-300';
+            } else {
+                statusDot.className = 'w-2.5 h-2.5 rounded-full bg-gray-500 inline-block';
+                statusBadge.className = 'flex items-center space-x-2 px-3 py-1.5 rounded-full text-xs font-mono bg-gray-800/80 border border-gray-700 text-gray-400';
+            }
+        }
+
+
+        // ==========================================
+        // 6. INITIALIZATION & EVENT BINDINGS
+        // ==========================================
+        window.onload = () => {
+            initThreeJS();
+            animateThreeJS();
+            drawOptFlowMap();
+            drawAltitudeChart();
+
+            // Button Click Handlers
+            document.getElementById('btnToggleSim').addEventListener('click', toggleSimulator);
+            document.getElementById('btnConnectSerial').addEventListener('click', connectSerial);
+
+            document.getElementById('btnResetView').addEventListener('click', () => {
+                if (camera) {
+                    camera.position.set(0, 4, 7);
+                    camera.lookAt(0, 0, 0);
+                }
+            });
+
+            document.getElementById('btnClearMap').addEventListener('click', () => {
+                state.optFlow.posX = 0;
+                state.optFlow.posY = 0;
+                state.optFlow.path = [];
+                drawOptFlowMap();
+                updateOptFlowUI();
+            });
+
+            document.getElementById('btnClearConsole').addEventListener('click', () => {
+                const container = document.getElementById('consoleContainer');
+                container.innerHTML = '';
+            });
+
+            document.getElementById('btnSendManualLog').addEventListener('click', () => {
+                const input = document.getElementById('manualLogInput');
+                if (input.value) {
+                    parseLogLine(input.value);
+                    input.value = '';
+                }
+            });
+
+            document.getElementById('manualLogInput').addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') {
+                    document.getElementById('btnSendManualLog').click();
+                }
+            });
+
+            // Console Filter Buttons
+            document.querySelectorAll('.filter-btn').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    document.querySelectorAll('.filter-btn').forEach(b => b.className = 'filter-btn px-2 py-0.5 text-[11px] font-mono rounded bg-gray-800 text-slate-400 hover:text-white');
+                    e.target.className = 'filter-btn px-2 py-0.5 text-[11px] font-mono rounded bg-cyan-600 text-white';
+                    state.filter = e.target.getAttribute('data-filter');
+                });
+            });
+
+            // Batch Paste Log Modal Handlers
+            const modal = document.getElementById('pasteModal');
+            document.getElementById('btnOpenPasteModal').addEventListener('click', () => modal.classList.remove('hidden'));
+            document.getElementById('btnClosePasteModal').addEventListener('click', () => modal.classList.add('hidden'));
+
+            document.getElementById('btnProcessBatchLog').addEventListener('click', () => {
+                const text = document.getElementById('pasteLogArea').value;
+                if (text) {
+                    const lines = text.split('\n');
+                    lines.forEach(line => parseLogLine(line));
+                }
+                modal.classList.add('hidden');
+            });
+        };
+    </script>
+</body>
+
+</html>

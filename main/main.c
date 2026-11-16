@@ -23,7 +23,7 @@ static const char *TAG = "MAIN_SYSTEM";
 #define I2C_SDA_PIN GPIO_NUM_21
 #define I2C_SCL_PIN GPIO_NUM_22
 #define PMW3901_CS_PIN GPIO_NUM_26
-
+#define VL53L0X_XSHUT_PIN GPIO_NUM_17
 // --- STRUCT LƯU TRẠNG THÁI MPU6500 ---
 typedef struct
 {
@@ -95,15 +95,15 @@ static void init_i2c_bus(void)
 {
     i2c_master_bus_config_t bus_config = {
         .i2c_port = I2C_NUM_0,
-        .sda_io_num = I2C_SDA_PIN,
-        .scl_io_num = I2C_SCL_PIN,
+        .sda_io_num = I2C_SDA_PIN, // GPIO 21
+        .scl_io_num = I2C_SCL_PIN, // GPIO 22
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .glitch_ignore_cnt = 7,
         .flags.enable_internal_pullup = true,
     };
     ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &i2c_bus_handle));
 
-    // Đăng ký VL53L0X với tốc độ 100kHz (an toàn hơn khi dùng pull-up nội)
+    // Đổi tốc độ về 100kHz để giao tiếp an toàn và ổn định hơn với pull-up nội
     i2c_device_config_t vl53_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = VL53L0X_DEFAULT_ADDRESS, // 0x29
@@ -247,7 +247,24 @@ void sensor_monitor_task(void *pvParameters)
         vTaskDelay(pdMS_TO_TICKS(50)); // In dữ liệu ở chu kỳ 20Hz (50ms)
     }
 }
-
+static void vl53l0x_hard_reset(void)
+{
+    // On common VL53L0X breakout boards, XSHUT is usually pulled up to HIGH with a 10 kΩ resistor.
+    // Drive LOW briefly to force a clean hardware reset before I2C initialization.
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << VL53L0X_XSHUT_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+    gpio_set_direction(VL53L0X_XSHUT_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(VL53L0X_XSHUT_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(2));
+    gpio_set_level(VL53L0X_XSHUT_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(2));
+}
 // --- MAIN ENTRY POINT ---
 void app_main(void)
 {
@@ -255,7 +272,6 @@ void app_main(void)
 
     // 1. Khởi tạo Buses
     app_spi_init();
-    init_i2c_bus();
 
     // 2. Chờ 50ms cho nguồn cảm biến ổn định hẳn
     vTaskDelay(pdMS_TO_TICKS(50));
@@ -271,6 +287,8 @@ void app_main(void)
     }
 
     // 4. Khởi tạo VL53L0X
+    vl53l0x_hard_reset(); // Reset phần cứng VL53L0X trước khi khởi tạo I2C
+    init_i2c_bus();
     if (vl53l0xInit(&vl53_dev, vl53_dev_handle, true))
     {
         ESP_LOGI(TAG, "VL53L0X I2C Init OK!");
