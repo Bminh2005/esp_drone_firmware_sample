@@ -1,337 +1,503 @@
 #include <stdio.h>
-#include <math.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <fcntl.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/semphr.h"
-#include "esp_timer.h"
 #include "esp_log.h"
-#include "driver/gpio.h"
-#include "driver/spi_master.h"
-#include "driver/i2c_master.h"
+#include "esp_timer.h"
+#include "nvs_flash.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "lwip/sockets.h"
 
-// Sensor Drivers & Math Tools
-#include "pmw3901.h"
-#include "vl53l0x.h"
-#include "driver_mpu6500_basic.h"
-#include "maholy.h"
+#include "state_estimator.h"
+#include "flight_control.h"
 
-static const char *TAG = "MAIN_SYSTEM";
+static const char *TAG = "MAIN_APP";
 
-// --- CHUYỂN ĐỔI ĐƠN VỊ ---
-#define RAD_TO_DEG (180.0f / M_PI)
-#define DEG_TO_RAD (M_PI / 180.0f)
-
-// --- CẤU HÌNH CHÂN NỐI PHẦN CỨNG (GPIO PINOUT) ---
-#define I2C_SDA_PIN GPIO_NUM_21
-#define I2C_SCL_PIN GPIO_NUM_22
-#define PMW3901_CS_PIN GPIO_NUM_26
-#define VL53L0X_XSHUT_PIN GPIO_NUM_17
-
-// --- STRUCT LƯU TRẠNG THÁI GYRO BIAS ---
-typedef struct
+// =========================================================================
+// 1. CẤU HÌNH TRẠNG THÁI FLIGHT STATE & THAM SỐ AN TOÀN
+// =========================================================================
+typedef enum
 {
-    float x;
-    float y;
-    float z;
-    bool is_calibrated;
-} gyro_bias_t;
+    STATE_DISARMED = 0,
+    STATE_ARMED_IDLE,
+    STATE_TAKEOFF_RAMP,
+    STATE_FLYING_MANUAL,
+    STATE_LANDING_AUTO,
+    STATE_EMERGENCY
+} drone_flight_state_t;
 
-static gyro_bias_t s_gyro_bias = {0};
+// =========================================================================
+// 1. CẤU HÌNH TRẠNG THÁI FLIGHT STATE & THAM SỐ AN TOÀN (ĐÃ TỐI ƯU CẤT CÁNH)
+// =========================================================================
+#define IDLE_THROTTLE 0.10f           // 10% Ga rốt-đa quay quét khi ARM
+#define TARGET_TAKEOFF_THROTTLE 0.46f // Ga cất cánh cơ bản (42%)
+#define TARGET_TAKEOFF_ALT 0.30f      // Cao độ mục tiêu (30cm)
 
-// --- QUẢN LÝ DỮ LIỆU MAHONY AHRS TOÀN CỤC & MUTEX ---
-static ahrs_state_t g_ahrs_state = {0};
-static SemaphoreHandle_t g_ahrs_mutex = NULL;
+// Ramp ga từ 10% -> 42% trong 0.9 giây để thoát mặt sàn dứt khoát
+#define THROTTLE_RAMP_RATE 0.25f // Độ cao cất cánh mục tiêu (30cm)
 
-// --- HANDLE THIẾT BỊ BUS ---
-i2c_master_bus_handle_t i2c_bus_handle = NULL;
-i2c_master_dev_handle_t vl53_dev_handle = NULL;
-spi_device_handle_t pmw3901_spi_handle = NULL;
+// Siết thời gian chờ lệnh Wi-Fi về 2.0 giây cho an toàn
+#define WIFI_COMMAND_TIMEOUT_US 2000000 // 2.0s Timeout -> Auto LANDING Failsafe
+// --- CẤU HÌNH WIFI SOFTAP & UDP ---
 
-static VL53L0xDev vl53_dev;
+static int s_udp_sock = -1;
+static struct sockaddr_in s_client_addr;
+static socklen_t s_client_addr_len = sizeof(s_client_addr);
+static bool s_client_connected = false;
 
-// --- KHỞI TẠO HARDWARE SPI DÀNH RIÊNG CHO PMW3901 (SPI3_HOST) ---
-static void app_spi_init(void)
+static drone_flight_state_t s_flight_state = STATE_DISARMED;
+static int64_t s_last_cmd_timestamp = 0;
+static uav_setpoint_t s_setpoint = {0};
+// --- CẤU HÌNH ROUTER WIFI ---
+#define ROUTER_SSID "TP-Link_318A"
+#define ROUTER_PASS "18596229"
+#define UDP_PORT 8888
+
+static EventGroupHandle_t s_wifi_event_group;
+#define WIFI_CONNECTED_BIT BIT0
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
 {
-    esp_err_t ret;
-
-    spi_bus_config_t buscfg_pmw = {
-        .miso_io_num = GPIO_NUM_33,
-        .mosi_io_num = GPIO_NUM_32,
-        .sclk_io_num = GPIO_NUM_25,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 64,
-    };
-    ret = spi_bus_initialize(SPI3_HOST, &buscfg_pmw, SPI_DMA_CH_AUTO);
-    ESP_ERROR_CHECK(ret);
-
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << PMW3901_CS_PIN),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-    };
-    gpio_config(&io_conf);
-    gpio_set_level(PMW3901_CS_PIN, 1);
-
-    spi_device_interface_config_t devcfg_pmw = {
-        .clock_speed_hz = 2 * 1000 * 1000,
-        .mode = 3,
-        .spics_io_num = -1,
-        .queue_size = 7,
-    };
-    ret = spi_bus_add_device(SPI3_HOST, &devcfg_pmw, &pmw3901_spi_handle);
-    ESP_ERROR_CHECK(ret);
-    ESP_LOGI(TAG, "Khoi tao SPI3_HOST cho PMW3901 thanh cong");
-
-    vTaskDelay(pdMS_TO_TICKS(50));
-}
-
-// --- KHỞI TẠO HARDWARE I2C DÀNH CHO VL53L0X ---
-static void init_i2c_bus(void)
-{
-    i2c_master_bus_config_t bus_config = {
-        .i2c_port = I2C_NUM_0,
-        .sda_io_num = I2C_SDA_PIN,
-        .scl_io_num = I2C_SCL_PIN,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &i2c_bus_handle));
-
-    i2c_device_config_t vl53_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = VL53L0X_DEFAULT_ADDRESS,
-        .scl_speed_hz = 100000,
-    };
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(i2c_bus_handle, &vl53_cfg, &vl53_dev_handle));
-}
-
-// --- HÀM HIỆU CHỈNH GYRO (OFFSETS) ---
-uint8_t mpu6500_gyro_calibrate(uint16_t sample_count)
-{
-    float accel_g[3];
-    float gyro_dps[3];
-    double sum_x = 0.0, sum_y = 0.0, sum_z = 0.0;
-    uint16_t valid_samples = 0;
-
-    ESP_LOGI(TAG, "=== Starting Gyro Calibration ===");
-    vTaskDelay(pdMS_TO_TICKS(500));
-
-    for (uint16_t i = 0; i < sample_count; i++)
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
     {
-        if (mpu6500_basic_read(accel_g, gyro_dps) == 0)
-        {
-            sum_x += gyro_dps[0];
-            sum_y += gyro_dps[1];
-            sum_z += gyro_dps[2];
-            valid_samples++;
-        }
-        vTaskDelay(pdMS_TO_TICKS(2));
+        esp_wifi_connect();
     }
-
-    if (valid_samples < (sample_count * 0.8f))
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
     {
-        ESP_LOGE(TAG, "Gyro calibration failed!");
-        s_gyro_bias.is_calibrated = false;
-        return 1;
+        ESP_LOGW(TAG, "Lost connection to Router. Retrying...");
+        esp_wifi_connect();
     }
-
-    s_gyro_bias.x = (float)(sum_x / valid_samples);
-    s_gyro_bias.y = (float)(sum_y / valid_samples);
-    s_gyro_bias.z = (float)(sum_z / valid_samples);
-    s_gyro_bias.is_calibrated = true;
-
-    ESP_LOGI(TAG, "Gyro Bias -> X: %.4f, Y: %.4f, Z: %.4f",
-             s_gyro_bias.x, s_gyro_bias.y, s_gyro_bias.z);
-
-    return 0;
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
+    {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, ">>> CONNECTED TO ROUTER! DRONE IP: " IPSTR " <<<", IP2STR(&event->ip_info.ip));
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
 }
 
-// --- TASK ĐỌC VÀ TÍNH TOÁN GÓC MAHONY AHRS (100Hz) ---
-void mpu6500_read_task(void *pvParameters)
+static void wifi_init_sta(void)
 {
-    float accel[3]; /* Ax, Ay, Az (g) */
-    float gyro[3];  /* Gx, Gy, Gz (dps) */
-    uint8_t res;
+    s_wifi_event_group = xEventGroupCreate();
 
-    /* 1. Khởi tạo MPU6500 SPI */
-    res = mpu6500_basic_init(MPU6500_INTERFACE_SPI, MPU6500_ADDRESS_AD0_LOW);
-    if (res != 0)
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = ROUTER_SSID,
+            .password = ROUTER_PASS,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    // Giới hạn công suất phát RF xuống 11dBm để tránh sụt áp LDO
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(44)); // 44 = 11dBm (4 * 11)
+
+    ESP_LOGI(TAG, "Connecting to Wi-Fi Router: %s ...", ROUTER_SSID);
+    // Chờ cho tới khi nhận được địa chỉ IP thành công mới đi tiếp
+    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+}
+// // =========================================================================
+// // 2. KHỞI TẠO WIFI SOFTAP & UDP BIDIRECTIONAL SOCKET
+// // =========================================================================
+// static void wifi_init_softap(void)
+// {
+//     ESP_ERROR_CHECK(esp_netif_init());
+//     ESP_ERROR_CHECK(esp_event_loop_create_default());
+//     esp_netif_create_default_wifi_ap();
+
+//     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+//     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+//     wifi_config_t wifi_config = {
+//         .ap = {
+//             .ssid = WIFI_SSID,
+//             .ssid_len = strlen(WIFI_SSID),
+//             .channel = 1,
+//             .password = WIFI_PASS,
+//             .max_connection = 4,
+//             .authmode = WIFI_AUTH_WPA2_PSK,
+//         },
+//     };
+//     if (strlen(WIFI_PASS) == 0)
+//     {
+//         wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+//     }
+
+//     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+//     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+//     ESP_ERROR_CHECK(esp_wifi_start());
+//     ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(WIFI_POWER_11dBm));
+//     ESP_LOGI(TAG, "Wi-Fi SoftAP Ready. SSID: %s | Port: %d", WIFI_SSID, UDP_PORT);
+// }
+
+static void udp_socket_init(void)
+{
+    s_udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (s_udp_sock < 0)
     {
-        ESP_LOGE(TAG, "MPU6500 SPI init failed!");
-        vTaskDelete(NULL);
+        ESP_LOGE(TAG, "Failed to create UDP socket: errno %d", errno);
         return;
     }
 
-    /* 2. Hiệu chỉnh Gyro lúc boot */
-    if (mpu6500_gyro_calibrate(1000) != 0)
+    struct sockaddr_in bind_addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(UDP_PORT),
+        .sin_addr.s_addr = htonl(INADDR_ANY)};
+
+    if (bind(s_udp_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0)
     {
-        vTaskDelete(NULL);
+        ESP_LOGE(TAG, "Failed to bind UDP socket: errno %d", errno);
+        close(s_udp_sock);
+        s_udp_sock = -1;
         return;
     }
 
-    /* 3. Khởi tạo thuật toán Mahony AHRS */
-    mahony_init();
+    int flags = fcntl(s_udp_sock, F_GETFL, 0);
+    fcntl(s_udp_sock, F_SETFL, flags | O_NONBLOCK);
 
-    TickType_t xLastWakeTime = xTaskGetTickCount();
-    int64_t last_time = esp_timer_get_time();
-
-    /* 4. Vòng lặp tính toán góc Mahony AHRS (Chu kỳ 10ms = 100Hz) */
-    while (1)
-    {
-        res = mpu6500_basic_read(accel, gyro);
-        if (res == 0)
-        {
-            // Tính khoảng dt thực tế chính xác bằng esp_timer
-            int64_t now = esp_timer_get_time();
-            float dt = (float)(now - last_time) / 1000000.0f;
-            last_time = now;
-
-            if (dt <= 0.0f || dt > 0.1f)
-            {
-                dt = 0.01f; // Chu kỳ mặc định 10ms nếu dt thất thường
-            }
-
-            // Trừ offset và đổi Gyro từ dps -> rad/s (bắt buộc cho Mahony)
-            float gx_raw = (gyro[0] - s_gyro_bias.x) * DEG_TO_RAD;
-            float gy_raw = (gyro[1] - s_gyro_bias.y) * DEG_TO_RAD;
-            float gz_raw = (gyro[2] - s_gyro_bias.z) * DEG_TO_RAD;
-
-            // 1. Remap Accel (Giữ chuẩn Right-Handed Coordinate System)
-            float ax_body = accel[1];  // Trục Y IMU làm hướng tiến (+X Body)
-            float ay_body = -accel[0]; // Trục X IMU làm hướng ngang (+Y Body, chú ý dấu ÂM)
-            float az_body = accel[2];  // Trục Z IMU hướng xuống (+Z Body)
-
-            // 2. Remap Gyro đồng bộ 1:1 theo trục Accel
-            float gx_body = gy_raw;  // Gyro Roll theo trục X body (từ Gyro Y IMU)
-            float gy_body = -gx_raw; // Gyro Pitch theo trục Y body (từ Gyro X IMU, đảo dấu)
-            float gz_body = -gz_raw; // Gyro Yaw (Xoay phải -> Yaw tăng)
-
-            // 3. Truyền vào Mahony AHRS
-            ahrs_state_t temp_ahrs;
-            mahony_ahrs_update_6dof(gx_body, gy_body, gz_body,
-                                    ax_body, ay_body, az_body,
-                                    dt, &temp_ahrs);
-            // Ghi dữ liệu an toàn vào biến toàn cục cho task monitor
-            if (xSemaphoreTake(g_ahrs_mutex, pdMS_TO_TICKS(1)) == pdTRUE)
-            {
-                g_ahrs_state = temp_ahrs;
-                xSemaphoreGive(g_ahrs_mutex);
-            }
-        }
-
-        /* Đảm bảo vòng lặp định thời 10ms (100Hz) */
-        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(10));
-    }
-
-    mpu6500_basic_deinit();
-    vTaskDelete(NULL);
+    ESP_LOGI(TAG, "UDP Socket Bound & Set Non-Blocking on Port %d", UDP_PORT);
 }
 
-// --- TASK ĐỌC PHỤ & MONITOR CẢM BIẾN (PMW3901, VL53L0X & MAHONY AHRS) ---
-void sensor_monitor_task(void *pvParameters)
+// =========================================================================
+// 3. HÀM GỬI LOG VĂN BẢN VÀ TELEMETRY QUA WIFI UDP
+// =========================================================================
+void udp_send_log(const char *format, ...)
 {
-    motionBurst_t pmw_motion = {0};
-    uint16_t distance_mm = 0;
-    ahrs_state_t local_ahrs = {0};
+    if (s_udp_sock < 0 || !s_client_connected)
+        return;
 
-    vl53l0xStartContinuous(&vl53_dev, 0);
+    char log_buf[256];
+    va_list args;
+    va_start(args, format);
+    int len = vsnprintf(log_buf, sizeof(log_buf), format, args);
+    va_end(args);
 
-    while (1)
+    if (len > 0)
     {
-        // 1. Đọc PMW3901 Optical Flow
-        pmw3901ReadMotion(PMW3901_CS_PIN, &pmw_motion);
-
-        // 2. Đọc VL53L0X ToF Distance
-        distance_mm = vl53l0xReadRangeContinuousMillimeters(&vl53_dev);
-
-        // 3. Đọc dữ liệu tư thế an toàn từ Mutex
-        if (xSemaphoreTake(g_ahrs_mutex, pdMS_TO_TICKS(5)) == pdTRUE)
-        {
-            local_ahrs = g_ahrs_state;
-            xSemaphoreGive(g_ahrs_mutex);
-        }
-
-        // Chuyển đổi góc từ Radian -> Độ (Degree)
-        float roll_deg = local_ahrs.roll * RAD_TO_DEG;
-        float pitch_deg = local_ahrs.pitch * RAD_TO_DEG;
-        float yaw_deg = local_ahrs.yaw * RAD_TO_DEG;
-
-        // 4. In tổng hợp dữ liệu toàn bộ hệ thống cảm biến (GIỮ NGUYÊN FORMAT GỐC FOR VISUALIZATION)
-        ESP_LOGI(TAG, "ATTITUDE | Roll: %6.2f | Pitch: %6.2f | Yaw: %6.2f",
-                 roll_deg, pitch_deg, yaw_deg);
-        ESP_LOGI(TAG, "OPT_FLOW | Motion: %d | DeltaX: %4d | DeltaY: %4d | SQual: %3d",
-                 pmw_motion.motionOccured,
-                 pmw_motion.deltaX,
-                 pmw_motion.deltaY,
-                 pmw_motion.squal);
-        ESP_LOGI(TAG, "ALTITUDE | Distance: %4d mm", distance_mm);
-        printf("--------------------------------------------------------------------\n");
-
-        vTaskDelay(pdMS_TO_TICKS(50)); // In dữ liệu ở chu kỳ 20Hz (50ms)
+        sendto(s_udp_sock, log_buf, len, MSG_DONTWAIT,
+               (struct sockaddr *)&s_client_addr, s_client_addr_len);
     }
 }
 
-static void vl53l0x_hard_reset(void)
+static void udp_stream_telemetry(const uav_state_t *state)
 {
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << VL53L0X_XSHUT_PIN),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&io_conf);
-    gpio_set_direction(VL53L0X_XSHUT_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level(VL53L0X_XSHUT_PIN, 0);
-    vTaskDelay(pdMS_TO_TICKS(2));
-    gpio_set_level(VL53L0X_XSHUT_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(2));
+    if (s_udp_sock < 0 || !s_client_connected || state == NULL)
+        return;
+
+    float vbat = flight_control_get_vbat();
+    const char *reason = flight_control_get_disarm_reason_str();
+
+    char tx_buffer[200];
+    int len = snprintf(tx_buffer, sizeof(tx_buffer),
+                       "/*R:%.1f,P:%.1f,Y:%.1f,Z:%.2f,Vbat:%.2fV,State:%d,Err:%s*/\n",
+                       state->roll_deg, state->pitch_deg, state->yaw_deg,
+                       state->z, vbat, (int)s_flight_state, reason);
+
+    // Cố định Port gửi log luôn là UDP_PORT (8888) thay vì lấy theo Port biến đổi của s_client_addr
+    struct sockaddr_in target_addr = s_client_addr;
+    target_addr.sin_port = htons(UDP_PORT);
+
+    sendto(s_udp_sock, tx_buffer, len, MSG_DONTWAIT,
+           (struct sockaddr *)&target_addr, sizeof(target_addr));
+}
+// =========================================================================
+// 4. HÀM XỬ LÝ LỆNH TỪ BÀN ĐIỀU KHIỂN WIFI (COMMAND PARSER)
+// =========================================================================
+static void process_wifi_commands(void)
+{
+    if (s_udp_sock < 0)
+        return;
+
+    char rx_buffer[128];
+    struct sockaddr_in from_addr;
+    socklen_t from_len = sizeof(from_addr);
+
+    int len = recvfrom(s_udp_sock, rx_buffer, sizeof(rx_buffer) - 1, 0,
+                       (struct sockaddr *)&from_addr, &from_len);
+
+    if (len > 0)
+    {
+        rx_buffer[len] = '\0';
+
+        memcpy(&s_client_addr, &from_addr, sizeof(from_addr));
+        s_client_connected = true;
+        s_last_cmd_timestamp = esp_timer_get_time();
+
+        if (strncmp(rx_buffer, "ARM", 3) == 0)
+        {
+            if (s_flight_state == STATE_DISARMED)
+            {
+                s_flight_state = STATE_ARMED_IDLE;
+                s_setpoint.hover_throttle = IDLE_THROTTLE;
+                s_setpoint.alt_z_m = 0.0f;
+                flight_control_set_setpoint(&s_setpoint);
+                flight_control_set_mode(FLIGHT_MODE_STABILIZE);
+                flight_control_arm();
+
+                udp_send_log("[SYSTEM_LOG] -> ARMED OK! Vbat = %.2fV\n", flight_control_get_vbat());
+                ESP_LOGW(TAG, "CMD RECV: >>> SYSTEM ARMED (IDLE) <<<");
+            }
+        }
+        else if (strncmp(rx_buffer, "DISARM", 6) == 0)
+        {
+            s_flight_state = STATE_DISARMED;
+            s_setpoint.hover_throttle = 0.0f;
+            flight_control_set_setpoint(&s_setpoint);
+            flight_control_disarm();
+
+            udp_send_log("[SYSTEM_LOG] -> DISARM CMD EXECUTED\n");
+            ESP_LOGW(TAG, "CMD RECV: >>> SYSTEM DISARMED <<<");
+        }
+        else if (strncmp(rx_buffer, "TAKEOFF", 7) == 0)
+        {
+            if (s_flight_state == STATE_ARMED_IDLE || s_flight_state == STATE_DISARMED)
+            {
+                if (!flight_control_is_armed())
+                {
+                    flight_control_arm();
+                }
+                s_flight_state = STATE_TAKEOFF_RAMP;
+                flight_control_set_mode(FLIGHT_MODE_POS_HOLD);
+
+                udp_send_log("[SYSTEM_LOG] -> TAKEOFF CMD INITIATED\n");
+                ESP_LOGW(TAG, "CMD RECV: >>> AUTO TAKEOFF INITIATED <<<");
+            }
+        }
+        else if (strncmp(rx_buffer, "LAND", 4) == 0)
+        {
+            if (s_flight_state == STATE_FLYING_MANUAL || s_flight_state == STATE_TAKEOFF_RAMP)
+            {
+                s_flight_state = STATE_LANDING_AUTO;
+                udp_send_log("[SYSTEM_LOG] -> LAND CMD INITIATED\n");
+                ESP_LOGW(TAG, "CMD RECV: >>> AUTO LANDING INITIATED <<<");
+            }
+        }
+        else if (strncmp(rx_buffer, "EMERGENCY", 9) == 0)
+        {
+            s_flight_state = STATE_EMERGENCY;
+            flight_control_disarm();
+            udp_send_log("[ALERT_LOG] -> EMERGENCY STOP TRIGGERED!\n");
+            ESP_LOGE(TAG, "CMD RECV: >>> EMERGENCY STOP TRIGGERED <<<");
+        }
+        // === XỬ LÝ LỆNH CALIB GYRO & RESET YAW VỀ 0.0 DEG ===
+        else if (strncmp(rx_buffer, "CALIB", 5) == 0 || strncmp(rx_buffer, "RESET_GYRO", 10) == 0)
+        {
+            if (s_flight_state == STATE_DISARMED)
+            {
+                udp_send_log("[SYSTEM_LOG] -> CALIBRATING GYRO... KEEP DRONE STILL!\n");
+                if (state_estimator_calibrate_gyro() == ESP_OK)
+                {
+                    udp_send_log("[SYSTEM_LOG] -> CALIB SUCCESS! Gyro Zeroed & Yaw Reset to 0.0 deg\n");
+                    ESP_LOGW(TAG, "Gyro Calibrated Successfully via UDP Command.");
+                }
+                else
+                {
+                    udp_send_log("[ALERT_LOG] -> CALIB FAILED! Sensor Read Error\n");
+                }
+            }
+            else
+            {
+                udp_send_log("[ALERT_LOG] -> REJECTED: Cannot Calibrate Gyro while ARMED/FLYING!\n");
+            }
+        }
+        else if (strncmp(rx_buffer, "MOVE", 4) == 0)
+        {
+            if (s_flight_state == STATE_FLYING_MANUAL)
+            {
+                float r = 0.0f, p = 0.0f, y = 0.0f, t_or_alt = 0.0f;
+                if (sscanf(rx_buffer, "MOVE %f %f %f %f", &r, &p, &y, &t_or_alt) == 4)
+                {
+                    s_setpoint.roll_deg = r;
+                    s_setpoint.pitch_deg = p;
+                    s_setpoint.yaw_rate_dps = y;
+
+                    if (flight_control_is_armed())
+                    {
+                        s_setpoint.alt_z_m = t_or_alt;
+                    }
+                    flight_control_set_setpoint(&s_setpoint);
+                }
+            }
+        }
+    }
 }
 
-// --- MAIN ENTRY POINT ---
+// =========================================================================
+// 5. CHƯƠNG TRÌNH CHÍNH (APP MAIN LOOP)
+// =========================================================================
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Initializing System Hardware...");
+    ESP_LOGI(TAG, "Starting Wi-Fi Controlled Drone System...");
 
-    // 0. Tạo Mutex bảo vệ dữ liệu AHRS giữa 2 Tasks
-    g_ahrs_mutex = xSemaphoreCreateMutex();
-    if (g_ahrs_mutex == NULL)
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
     {
-        ESP_LOGE(TAG, "Khong the tao Mutex AHRS!");
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    wifi_init_sta();
+    udp_socket_init();
+
+    if (state_estimator_init() != ESP_OK)
+    {
+        ESP_LOGE(TAG, "State Estimator Init Failed! System Halted.");
         return;
     }
 
-    // 1. Khởi tạo Buses
-    app_spi_init();
-
-    // 2. Chờ 50ms cho nguồn cảm biến ổn định hẳn
-    vTaskDelay(pdMS_TO_TICKS(50));
-
-    // 3. Khởi tạo PMW3901
-    if (pmw3901Init(PMW3901_CS_PIN))
+    if (flight_control_init() != ESP_OK)
     {
-        ESP_LOGI(TAG, "PMW3901 SPI Init OK!");
-    }
-    else
-    {
-        ESP_LOGE(TAG, "PMW3901 SPI Init FAIL!");
+        ESP_LOGE(TAG, "Flight Control Init Failed! System Halted.");
+        return;
     }
 
-    // 4. Khởi tạo VL53L0X
-    vl53l0x_hard_reset();
-    init_i2c_bus();
-    if (vl53l0xInit(&vl53_dev, vl53_dev_handle, true))
-    {
-        ESP_LOGI(TAG, "VL53L0X I2C Init OK!");
-    }
-    else
-    {
-        ESP_LOGE(TAG, "VL53L0X I2C Init FAIL!");
-    }
+    flight_control_disarm();
 
-    // 5. Tạo Tasks
-    xTaskCreatePinnedToCore(mpu6500_read_task, "mpu6500_task", 4096, NULL, 10, NULL, 1);
-    xTaskCreatePinnedToCore(sensor_monitor_task, "monitor_task", 4096, NULL, 5, NULL, 0);
+    s_setpoint.roll_deg = 0.0f;
+    s_setpoint.pitch_deg = 0.0f;
+    s_setpoint.yaw_rate_dps = 0.0f;
+    s_setpoint.alt_z_m = 0.00f;
+    s_setpoint.hover_throttle = 0.00f;
+    flight_control_set_setpoint(&s_setpoint);
+
+    uav_state_t state = {0};
+    int64_t last_time = esp_timer_get_time();
+
+    ESP_LOGI(TAG, "=== DRONE READY. WAITING FOR WIFI UDP COMMANDS... ===");
+
+    while (1)
+    {
+        int64_t now = esp_timer_get_time();
+        float dt = (float)(now - last_time) / 1000000.0f;
+        last_time = now;
+        if (dt <= 0.001f || dt > 0.05f)
+            dt = 0.01f;
+
+        // 1. Xử lý lệnh Wi-Fi UDP
+        process_wifi_commands();
+
+        // 2. Lấy dữ liệu cảm biến
+        if (state_estimator_get_state(&state))
+        {
+            // 3. FAILSAFE: Mất kết nối Wi-Fi khi đang bay
+            if (s_client_connected &&
+                (s_flight_state == STATE_FLYING_MANUAL || s_flight_state == STATE_TAKEOFF_RAMP))
+            {
+                if (now - s_last_cmd_timestamp > WIFI_COMMAND_TIMEOUT_US)
+                {
+                    udp_send_log("[ALERT_LOG] -> WIFI SIGNAL LOST! ACTIVATING AUTO-LANDING\n");
+                    ESP_LOGE(TAG, ">>> WIFI SIGNAL LOST! ACTIVATING EMERGENCY AUTO-LANDING <<<");
+                    s_flight_state = STATE_LANDING_AUTO;
+                }
+            }
+
+            // 4. BẢO VỆ NGẮT KHẨN CẤP PHẦN CỨNG (Inverted / Low Battery / Manual Disarm)
+            if (!flight_control_is_armed() && s_flight_state != STATE_DISARMED)
+            {
+                s_flight_state = STATE_DISARMED;
+                udp_send_log("[ALERT_LOG] -> DISARM TRIGGERED! Reason: %s | Vbat: %.2fV\n",
+                             flight_control_get_disarm_reason_str(), flight_control_get_vbat());
+            }
+
+            // 5. THỰC THI FSM THEO LỆNH
+            switch (s_flight_state)
+            {
+            case STATE_DISARMED:
+            case STATE_EMERGENCY:
+                flight_control_disarm();
+                break;
+
+            case STATE_ARMED_IDLE:
+                s_setpoint.hover_throttle = IDLE_THROTTLE;
+                s_setpoint.alt_z_m = 0.00f;
+                flight_control_set_setpoint(&s_setpoint);
+                break;
+
+            case STATE_TAKEOFF_RAMP:
+                // 1. Tăng ga dứt khoát 18%/s (10% -> 48% trong ~2.1s)
+                if (s_setpoint.hover_throttle < TARGET_TAKEOFF_THROTTLE)
+                {
+                    s_setpoint.hover_throttle += THROTTLE_RAMP_RATE * dt;
+                    if (s_setpoint.hover_throttle > TARGET_TAKEOFF_THROTTLE)
+                        s_setpoint.hover_throttle = TARGET_TAKEOFF_THROTTLE;
+                }
+
+                // 2. Nâng setpoint độ cao Z song song từ 0m -> 0.30m (với tốc độ 0.15m/s)
+                if (s_setpoint.alt_z_m < TARGET_TAKEOFF_ALT)
+                {
+                    s_setpoint.alt_z_m += 0.15f * dt;
+                    if (s_setpoint.alt_z_m > TARGET_TAKEOFF_ALT)
+                        s_setpoint.alt_z_m = TARGET_TAKEOFF_ALT;
+                }
+                flight_control_set_setpoint(&s_setpoint);
+
+                // 3. Khi ga đạt 48% và độ cao tiệm cận 30cm -> Chuyển sang MANUAL bay tự do
+                if (s_setpoint.hover_throttle >= TARGET_TAKEOFF_THROTTLE &&
+                    s_setpoint.alt_z_m >= (TARGET_TAKEOFF_ALT - 0.05f))
+                {
+                    s_flight_state = STATE_FLYING_MANUAL;
+                    udp_send_log("[SYSTEM_LOG] -> Takeoff Complete -> Entered MANUAL Mode\n");
+                    ESP_LOGI(TAG, "Takeoff Complete -> Entered MANUAL FLYING Mode.");
+                }
+                break;
+
+            case STATE_FLYING_MANUAL:
+                break;
+
+            case STATE_LANDING_AUTO:
+                s_setpoint.alt_z_m -= 0.05f * dt;
+                if (s_setpoint.alt_z_m < 0.00f)
+                    s_setpoint.alt_z_m = 0.00f;
+
+                if (s_setpoint.alt_z_m < 0.10f && s_setpoint.hover_throttle > IDLE_THROTTLE)
+                {
+                    s_setpoint.hover_throttle -= THROTTLE_RAMP_RATE * dt;
+                    if (s_setpoint.hover_throttle < IDLE_THROTTLE)
+                        s_setpoint.hover_throttle = IDLE_THROTTLE;
+                }
+                flight_control_set_setpoint(&s_setpoint);
+
+                if (s_setpoint.alt_z_m <= 0.00f && (state.z < 0.08f || s_setpoint.hover_throttle <= IDLE_THROTTLE))
+                {
+                    s_flight_state = STATE_DISARMED;
+                    s_setpoint.hover_throttle = 0.00f;
+                    flight_control_set_setpoint(&s_setpoint);
+                    flight_control_disarm();
+
+                    udp_send_log("[SYSTEM_LOG] -> AUTO LANDING COMPLETED -> DISARMED\n");
+                    ESP_LOGW(TAG, "=== AUTO LANDING COMPLETED -> DISARMED ===");
+                }
+                break;
+
+            default:
+                break;
+            }
+
+            // 6. Cập nhật vòng lặp PID
+            flight_control_update(&state, dt);
+
+            // 7. Gửi Telemetry định kỳ qua UDP
+            udp_stream_telemetry(&state);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
 }
