@@ -1,89 +1,30 @@
 #ifndef FLIGHT_CONTROL_H
 #define FLIGHT_CONTROL_H
 
-#include <stdbool.h>
-#include <stdint.h>
-#include "esp_err.h"
 #include "state_estimator.h"
+#include "driver/gpio.h"
+#include "driver/ledc.h"
 
-#ifdef __cplusplus
-extern "C"
-{
-#endif
+// --- GÁN CHÂN GPIO ĐỘNG CƠ (KHUNG XINWEI E1 / ESP32 MINI DRONE) ---
+#define MOTOR_1_GPIO GPIO_NUM_15 // M1: Trước - Phải
+#define MOTOR_2_GPIO GPIO_NUM_13 // M2: Sau - Phải
+#define MOTOR_3_GPIO GPIO_NUM_12 // M3: Sau - Trái
+#define MOTOR_4_GPIO GPIO_NUM_14 // M4: Trước - Trái
 
-    // --- CHẾ ĐỘ BAY (FLIGHT MODES) ---
-    typedef enum
-    {
-        FLIGHT_MODE_DISARMED = 0, // Khóa động cơ (PWM = 0)
-        FLIGHT_MODE_RATE,         // Điều khiển Tốc độ góc (Acro Mode - Vòng trong cùng)
-        FLIGHT_MODE_STABILIZE,    // Điều khiển Góc nghiêng (Angle Mode - Cân bằng tự động)
-        FLIGHT_MODE_ALT_HOLD,     // Điều khiển Cao độ (Tự giữ Z)
-        FLIGHT_MODE_POS_HOLD      // Điều khiển Vị trí 2D (Tự đứng yên 1 chỗ X, Y, Z)
-    } flight_mode_t;
+// --- CẤU HÌNH PWM LEDC DRIVER ---
+// Đổi độ phân giải LEDC từ 13-bit sang 11-bit (hoặc 10-bit)
+#define LEDC_PWM_FREQ_HZ 20000         // Tần số 20kHz cho motor coreless
+#define LEDC_PWM_RES LEDC_TIMER_11_BIT // 11-bit resolution (0 -> 2047)
 
-    // --- DỮ LIỆU MỤC TIÊU ĐIỀU KHIỂN (SETPOINT) ---
-    typedef struct
-    {
-        float roll_deg;       // Góc Roll mục tiêu (độ)
-        float pitch_deg;      // Góc Pitch mục tiêu (độ)
-        float yaw_rate_dps;   // Tốc độ xoay Yaw mục tiêu (độ/s)
-        float alt_z_m;        // Cao độ mục tiêu (m)
-        float pos_x_m;        // Vị trí X mục tiêu (m)
-        float pos_y_m;        // Vị trí Y mục tiêu (m)
-        float hover_throttle; // Mức Ga lơ lửng tĩnh (0.0 - 1.0, ví dụ 0.45 = 45% PWM)
-    } uav_setpoint_t;
+// --- GIỚI HẠN AN TOÀN PHẦN CỨNG ---
+#define MAX_MOTOR_PWM 0.88f      // Kẹp trần 88% chống sụt áp LDO
+#define MIN_MOTOR_PWM 0.01f      // Xung Idle nhỏ nhất (5%)
+#define MAX_PWM_SLEW_RATE 0.70f  // Giới hạn gia tốc PWM (1/s) chống dòng xả đỉnh
+#define UNSTICK_ALTITUDE_M 0.03f // Ngưỡng rời sàn 3cm
+#define FAILSAFE_TIMEOUT_MS 500  // Timeout ngắt UDP (ms)
 
-    // --- CẤU HÌNH BỘ THAM SỐ PID ---
-    typedef struct
-    {
-        float kp;
-        float ki;
-        float kd;
-        float i_term;
-        float i_max;   // Anti-windup limit
-        float out_max; // Giới hạn đầu ra cực đại
-        float prev_error;
-    } pid_controller_t;
-
-    /**
-     * @brief Khởi tạo ngoại vi LEDC PWM cho 4 động cơ và reset tham số PID.
-     * @return esp_err_t ESP_OK nếu khởi tạo thành công.
-     */
-    esp_err_t flight_control_init(void);
-
-    /**
-     * @brief Chuyển đổi trạng thái ARM / DISARM bảo vệ an toàn.
-     */
-    void flight_control_arm(void);
-    void flight_control_disarm(void);
-    bool flight_control_is_armed(void);
-
-    /**
-     * @brief Thiết lập Chế độ bay và Điểm mục tiêu (Setpoint).
-     */
-    void flight_control_set_mode(flight_mode_t mode);
-    void flight_control_set_setpoint(const uav_setpoint_t *setpoint);
-
-    /**
-     * @brief TÍNH TOÁN VÒNG LẶP PID PHÂN TẦNG (Gọi liên tục ở tần số 100Hz).
-     * @param state Trạng thái ước lượng mới nhất từ state_estimator.
-     * @param dt Khoảng thời gian thực tế giữa 2 lần tính toán (giây).
-     */
-    void flight_control_update(const uav_state_t *state, float dt);
-    typedef enum
-    {
-        DISARM_REASON_NONE = 0,
-        DISARM_REASON_USER_CMD,
-        DISARM_REASON_LOW_BATTERY, // Sụt áp < 3.0V
-        DISARM_REASON_INVERTED,    // Nghiêng > 60 độ
-        DISARM_REASON_WIFI_LOST    // Mất Wi-Fi Timeout
-    } disarm_reason_t;
-
-    float flight_control_get_vbat(void);
-    disarm_reason_t flight_control_get_disarm_reason(void);
-    const char *flight_control_get_disarm_reason_str(void);
-#ifdef __cplusplus
-}
-#endif
+void flight_control_init(void);
+void flight_control_step(const uav_state_t *state, const drone_setpoint_t *setpoint, float dt);
+void flight_control_disarm_motors(void);
 
 #endif // FLIGHT_CONTROL_H

@@ -1,71 +1,51 @@
 #ifndef STATE_ESTIMATOR_H
 #define STATE_ESTIMATOR_H
 
-#include <stdbool.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include "esp_err.h"
 
-#ifdef __cplusplus
-extern "C"
+// Struct trạng thái ước lượng từ IMU + Sensors
+typedef struct
 {
-#endif
+    float roll;       // rad
+    float pitch;      // rad
+    float yaw;        // rad
+    float roll_deg;   // deg
+    float pitch_deg;  // deg
+    float yaw_deg;    // deg
+    float gyro_x;     // rad/s (Trục X Body)
+    float gyro_y;     // rad/s (Trục Y Body)
+    float gyro_z;     // rad/s (Trục Z Body)
+    float x;          // m (Position X)
+    float y;          // m (Position Y)
+    float z;          // m (Altitude ToF)
+    float vx;         // m/s (Velocity X)
+    float vy;         // m/s (Velocity Y)
+    float vz;         // m/s (Velocity Z)
+    uint16_t dist_mm; // Khoảng cách thô ToF (mm)
+    uint8_t squal;    // Chất lượng ảnh Optical Flow
+    bool is_initialized;
+} uav_state_t;
 
-    // --- STRUCT CHỨA TOÀN BỘ TRẠNG THÁI UAV (DÙNG CHO PID & LOGGING) ---
-    typedef struct
-    {
-        // 1. Tư thế Attitude (Radian)
-        float roll;  // Roll (rad)
-        float pitch; // Pitch (rad)
-        float yaw;   // Yaw (rad)
+// Struct lệnh điều khiển nhận từ UDP
+typedef struct
+{
+    float roll_target;       // deg (-30 đến +30)
+    float pitch_target;      // deg (-30 đến +30)
+    float yaw_rate_target;   // deg/s
+    float z_target;          // m
+    float vx_target;         // m/s
+    float vy_target;         // m/s
+    float base_thrust;       // 0.0f -> 1.0f (PWM ratio)
+    bool armed;              // Trạng thái cho phép chạy motor
+    uint32_t last_packet_ms; // Timestamp gói tin UDP cuối cùng
+} drone_setpoint_t;
 
-        // 2. Tư thế Attitude (Degree) - Dùng cho telemetry & visualizer
-        float roll_deg;  // Roll (độ)
-        float pitch_deg; // Pitch (độ)
-        float yaw_deg;   // Yaw (độ)
-
-        // 3. Tốc độ góc Body Frame (rad/s) - BẮT BUỘC CHO VÒNG LẶP RATE PID
-        float gyro_x; // Roll rate (rad/s)
-        float gyro_y; // Pitch rate (rad/s)
-        float gyro_z; // Yaw rate (rad/s)
-
-        // 4. Cao độ EKF 1D & ToF
-        float z;          // Cao độ thực tế (m)
-        float vz;         // Vận tốc đứng (m/s)
-        uint16_t dist_mm; // Khoảng cách thô ToF (mm)
-
-        // 5. Vị trí & Vận tốc EKF 2D (Optical Flow)
-        float x;       // Tọa độ X (m)
-        float y;       // Tọa độ Y (m)
-        float vx;      // Vận tốc ngang Vx (m/s)
-        float vy;      // Vận tốc ngang Vy (m/s)
-        uint8_t squal; // Chất lượng điểm ảnh Optical Flow (0 - 255)
-
-        // 6. Trạng thái hệ thống
-        bool is_initialized;
-    } uav_state_t;
-
-    /**
-     * @brief Khởi tạo toàn bộ Bus (SPI, I2C), cảm biến và kích hoạt các FreeRTOS Task EKF.
-     * @return esp_err_t ESP_OK nếu thành công.
-     */
-    esp_err_t state_estimator_init(void);
-
-    /**
-     * @brief Trích xuất trạng thái ước lượng mới nhất của UAV (Thread-safe qua Mutex).
-     * @param out_state Con trỏ trỏ tới struct uav_state_t nhận dữ liệu.
-     * @return true nếu lấy dữ liệu thành công.
-     */
-    bool state_estimator_get_state(uav_state_t *out_state);
-
-    esp_err_t state_estimator_calibrate_gyro(void);
-    /**
-     * @brief In chuỗi Telemetry định dạng Visualizer ra UART.
-     * @param state Con trỏ dữ liệu state.
-     */
-    void state_estimator_stream_telemetry(const uav_state_t *state);
-
-#ifdef __cplusplus
-}
-#endif
+// Public APIs
+esp_err_t state_estimator_init(void);
+esp_err_t state_estimator_calibrate_gyro(void);
+bool state_estimator_get_state(uav_state_t *out_state);
+void state_estimator_stream_telemetry(const uav_state_t *state);
 
 #endif // STATE_ESTIMATOR_H

@@ -1,51 +1,51 @@
 import socket
-import threading
-import sys
 
-ESP32_IP = "192.168.0.103"
-UDP_PORT = 8888
+# Cấu hình UDP Listener
+UDP_IP = "0.0.0.0"  # Lắng nghe trên tất cả card mạng
+UDP_PORT = 8889
 
-# Tạo 1 Socket duy nhất cho cả Nhận và Gửi
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind(("0.0.0.0", UDP_PORT))
-sock.settimeout(1.0)
+def listen_telemetry():
+    # Tạo Socket UDP
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((UDP_IP, UDP_PORT))
+    
+    print(f"[*] Đang lắng nghe Telemetry từ ESP32 tại cổng UDP {UDP_PORT}...")
 
-# 1. THREAD LẮNG NGHE VÀ IN TELEMETRY / LOG
-def receive_thread():
-    print(f"[INFO] Đã kết nối UDP Port {UDP_PORT}. Đang nhận log...")
     while True:
         try:
+            # Nhận dữ liệu thô từ socket
             data, addr = sock.recvfrom(1024)
-            msg = data.decode('utf-8', errors='ignore').strip()
-            
-            if "[ALERT_LOG]" in msg or ("Err:" in msg and "Err:USER_DISARM_CMD" not in msg and "Err:NONE" not in msg):
-                print(f"\033[91m[CẢNH BÁO SỰ CỐ] {msg}\033[0m")
-            elif "[SYSTEM_LOG]" in msg:
-                print(f"\033[93m[HỆ THỐNG] {msg}\033[0m")
-            else:
-                print(f"\033[92m[TELEMETRY] {msg}\033[0m")
-        except socket.timeout:
-            continue
+            line = data.decode('utf-8', errors='ignore').strip()
+
+            # Kiểm tra khung gói tin chuẩn /* ... */
+            if line.startswith("/*") and line.endswith("*/"):
+                # Cắt bỏ 2 ký tự đầu '/*' và 2 ký tự cuối '*/'
+                raw_str = line[2:-2]
+                items = raw_str.split(',')
+
+                # Đảm bảo đủ 10 thông số
+                if len(items) == 10:
+                    roll  = float(items[0])
+                    pitch = float(items[1])
+                    yaw   = float(items[2])
+                    x     = float(items[3])
+                    y     = float(items[4])
+                    z     = float(items[5])
+                    vx    = float(items[6])
+                    vy    = float(items[7])
+                    vz    = float(items[8])
+                    squal = int(float(items[9]))
+
+                    # === TRUỶ XUẤT VÀ SỬ DỤNG BIẾN THÁI DỰ ÁN TẠI ĐÂY ===
+                    print(f"[{addr[0]}]X={x:.3f}m Y={y:.3f}m Z={z:.3f}m | Roll={roll:.1f}° Pitch={pitch:.1f}° Yaw={yaw:.1f}° | Flow Quality={squal}")
+
+        except KeyboardInterrupt:
+            print("\nĐã dừng lắng nghe Telemetry.")
+            break
         except Exception as e:
-            print(f"[LỖI RECEIVE]: {e}")
-            break
+            print(f"Lỗi parse dữ liệu: {e}")
 
-# Kích hoạt Thread nhận Log chạy ngầm
-t = threading.Thread(target=receive_thread, daemon=True)
-t.start()
+    sock.close()
 
-# 2. VÒNG LẶP NHẬP LỆNH TỪ BÀN PHÍM (CONSOLE COMMAND)
-print("=== BÀN ĐIỀU KHIỂN ESP32 DRONE ===")
-print("Nhập lệnh: ARM | DISARM | TAKEOFF | LAND | CALIB | EMERGENCY | exit")
-
-try:
-    while True:
-        cmd = input().strip()
-        if cmd.lower() == 'exit':
-            break
-        if cmd:
-            # Gửi lệnh trực tiếp qua UDP từ chính Socket lắng nghe
-            sock.sendto(cmd.encode('utf-8'), (ESP32_IP, UDP_PORT))
-            print(f"--> Đã gửi lệnh: {cmd}")
-except KeyboardInterrupt:
-    print("\nĐã thoát chương trình.")
+if __name__ == "__main__":
+    listen_telemetry()

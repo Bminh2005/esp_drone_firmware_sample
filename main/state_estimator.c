@@ -1,6 +1,7 @@
 #include "state_estimator.h"
 
 #include <stdio.h>
+#include <string.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -22,22 +23,22 @@
 static const char *TAG = "STATE_ESTIMATOR";
 
 // --- HẰNG SỐ ĐƠN VỊ & NGƯỠNG KHỬ NHIỄU ---
-#define RAD_TO_DEG (180.0f / M_PI)
-#define DEG_TO_RAD (M_PI / 180.0f)
+#define RAD_TO_DEG (180.0f / 3.1415926535f)
+#define DEG_TO_RAD (3.1415926535f / 180.0f)
 #define GRAVITY_MSS 9.80665f
-#define GYRO_DEADBAND_RAD (0.12f * DEG_TO_RAD) // Ngưỡng vùng chết 0.12 deg/s chống trôi Yaw
+#define GYRO_DEADBAND_RAD (0.12f * DEG_TO_RAD)
 
-// --- BIAS GIA TỐC CỐ ĐỊNH (CALIB 180°) ---
+// --- BIAS GIA TỐC CỐ ĐỊNH ---
 #define ACCEL_BIAS_X (+0.0108f)
 #define ACCEL_BIAS_Y (+0.0058f)
 #define ACCEL_BIAS_Z (+0.0586f)
 
-// --- BIAS GYRO ĐỘNG (ĐƯỢC CẬP NHẬT KHỞI ĐỘNG VÀ KHI GỬI LỆNH CALIB) ---
+// --- BIAS GYRO ĐỘNG ---
 static float s_gyro_bias_x = -0.0009f;
 static float s_gyro_bias_y = +0.0138f;
 static float s_gyro_bias_z = +0.0043f;
 
-// --- BIẾN ĐỒNG BỘ CALIB GYRO AN TOÀN ĐA LUỒNG ---
+// --- BIẾN ĐỒNG BỘ CALIB GYRO ---
 static volatile bool s_calib_requested = false;
 static volatile bool s_calib_done = false;
 
@@ -47,7 +48,7 @@ static volatile bool s_calib_done = false;
 #define PMW3901_CS_PIN GPIO_NUM_26
 #define VL53L0X_XSHUT_PIN GPIO_NUM_17
 
-// --- BIẾN CỤC BỘ NỘI BỘ MODULE ---
+// --- BIẾN NỘI BỘ MODULE ---
 static uav_state_t s_uav_state = {0};
 static SemaphoreHandle_t s_state_mutex = NULL;
 
@@ -56,7 +57,6 @@ static i2c_master_dev_handle_t s_vl53_dev_handle = NULL;
 spi_device_handle_t pmw3901_spi_handle = NULL;
 static VL53L0xDev s_vl53_dev;
 
-// --- KHỞI TẠO BUS NỘI BỘ ---
 static void app_spi_init(void)
 {
     spi_bus_config_t buscfg_pmw = {
@@ -102,7 +102,7 @@ static void init_i2c_bus(void)
     i2c_device_config_t vl53_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = VL53L0X_DEFAULT_ADDRESS,
-        .scl_speed_hz = 100000,
+        .scl_speed_hz = 400000,
     };
     ESP_ERROR_CHECK(i2c_master_bus_add_device(s_i2c_bus_handle, &vl53_cfg, &s_vl53_dev_handle));
 }
@@ -124,7 +124,7 @@ static void vl53l0x_hard_reset(void)
     vTaskDelay(pdMS_TO_TICKS(2));
 }
 
-// --- TASK ĐỌC IMU 100Hz (MAHONY AHRS + EKF PREDICT + GYRO CALIB) ---
+// --- TASK ĐỌC IMU (CORE 1 - NÂNG LÊN 250Hz / MAHONY AHRS + EKF PREDICT) ---
 static void mpu6500_read_task(void *pvParameters)
 {
     float accel[3], gyro[3];
@@ -140,9 +140,12 @@ static void mpu6500_read_task(void *pvParameters)
     TickType_t xLastWakeTime = xTaskGetTickCount();
     int64_t last_time = esp_timer_get_time();
 
-    // Biến tích lũy mẫu Calib Gyro
     float accum_gx = 0.0f, accum_gy = 0.0f, accum_gz = 0.0f;
     int calib_count = 0;
+
+    // Biến tích lũy gia tốc để hạ tần số EKF xuống 50Hz (nhẹ CPU)
+    static uint8_t ekf_divider = 0;
+    static float az_accum = 0.0f, ax_accum = 0.0f, ay_accum = 0.0f;
 
     while (1)
     {
@@ -151,12 +154,10 @@ static void mpu6500_read_task(void *pvParameters)
             int64_t now = esp_timer_get_time();
             float dt = (float)(now - last_time) / 1000000.0f;
             last_time = now;
-            if (dt <= 0.0f || dt > 0.1f)
-                dt = 0.01f;
+            if (dt <= 0.0f || dt > 0.05f)
+                dt = 0.004f; // 250Hz
 
-            // =========================================================================
-            // LỰA CHỌN 1: TIẾN HÀNH CALIB GYRO ĐỘNG KHI CÓ YÊU CẦU (100 MẪU ~ 1.0 GIÂY)
-            // =========================================================================
+            // CALIB GYRO ĐỘNG (250 MẪU ~ 1.0 GIÂY)
             if (s_calib_requested)
             {
                 accum_gx += gyro[0] * DEG_TO_RAD;
@@ -164,26 +165,24 @@ static void mpu6500_read_task(void *pvParameters)
                 accum_gz += gyro[2] * DEG_TO_RAD;
                 calib_count++;
 
-                if (calib_count >= 100)
+                if (calib_count >= 250)
                 {
-                    s_gyro_bias_x = accum_gx / 100.0f;
-                    s_gyro_bias_y = accum_gy / 100.0f;
-                    s_gyro_bias_z = accum_gz / 100.0f;
+                    s_gyro_bias_x = accum_gx / 250.0f;
+                    s_gyro_bias_y = accum_gy / 250.0f;
+                    s_gyro_bias_z = accum_gz / 250.0f;
 
                     accum_gx = accum_gy = accum_gz = 0.0f;
                     calib_count = 0;
 
-                    // Tái khởi tạo Mahony Quaternion & Reset góc Yaw tích lũy về 0.0
                     mahony_init();
+                    altitude_filter_init(0.0f);
+                    flow_filter_init();
 
                     if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE)
                     {
-                        s_uav_state.roll = 0.0f;
-                        s_uav_state.pitch = 0.0f;
-                        s_uav_state.yaw = 0.0f;
-                        s_uav_state.roll_deg = 0.0f;
-                        s_uav_state.pitch_deg = 0.0f;
-                        s_uav_state.yaw_deg = 0.0f;
+                        bool init_flag = s_uav_state.is_initialized;
+                        memset(&s_uav_state, 0, sizeof(uav_state_t));
+                        s_uav_state.is_initialized = init_flag;
                         xSemaphoreGive(s_state_mutex);
                     }
 
@@ -191,15 +190,11 @@ static void mpu6500_read_task(void *pvParameters)
                     s_calib_done = true;
                 }
 
-                vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(10));
-                continue; // Tạm dừng tính toán EKF trong lúc thu thập mẫu Calib
+                vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(4));
+                continue;
             }
 
-            // =========================================================================
-            // LỰA CHỌN 2: CHẠY BỘ LỌC THÁI ĐỘ MAHONY AHRS BÌNH THƯỜNG
-            // =========================================================================
-
-            // 1. Trừ Bias thô trên hệ trục IMU
+            // BÙ BIAS THÔ VÀ REMAP SANG BODY FRAME
             float ax_imu_cal = accel[0] - ACCEL_BIAS_X;
             float ay_imu_cal = accel[1] - ACCEL_BIAS_Y;
             float az_imu_cal = accel[2] - ACCEL_BIAS_Z;
@@ -208,7 +203,6 @@ static void mpu6500_read_task(void *pvParameters)
             float gy_raw = (gyro[1] * DEG_TO_RAD) - s_gyro_bias_y;
             float gz_raw = (gyro[2] * DEG_TO_RAD) - s_gyro_bias_z;
 
-            // 2. Remap sang Body Frame (+X Forward, +Y Right, +Z Down)
             float ax_body = ay_imu_cal;
             float ay_body = -ax_imu_cal;
             float az_body = az_imu_cal;
@@ -217,21 +211,17 @@ static void mpu6500_read_task(void *pvParameters)
             float gy_body = -gx_raw;
             float gz_body = -gz_raw;
 
-            // 3. GYRO DEADBAND: Áp dụng dải chết để triệt tiêu hoàn toàn trôi Yaw khi đứng im
-            if (fabsf(gx_body) < GYRO_DEADBAND_RAD)
-                gx_body = 0.0f;
-            if (fabsf(gy_body) < GYRO_DEADBAND_RAD)
-                gy_body = 0.0f;
-            if (fabsf(gz_body) < GYRO_DEADBAND_RAD)
-                gz_body = 0.0f;
+            float gx_mahony = (fabsf(gx_body) < GYRO_DEADBAND_RAD) ? 0.0f : gx_body;
+            float gy_mahony = (fabsf(gy_body) < GYRO_DEADBAND_RAD) ? 0.0f : gy_body;
+            float gz_mahony = (fabsf(gz_body) < GYRO_DEADBAND_RAD) ? 0.0f : gz_body;
 
-            // 4. Cập nhật Mahony AHRS
+            // 1. MAHONY AHRS UPDATE (CHẠY ĐỦ 250Hz ĐỂ ĐỦ GÓC NGHIÊNG MỚI NHẤT CHO PID)
             ahrs_state_t temp_ahrs;
-            mahony_ahrs_update_6dof(gx_body, gy_body, gz_body,
+            mahony_ahrs_update_6dof(gx_mahony, gy_mahony, gz_mahony,
                                     ax_body, ay_body, az_body,
                                     dt, &temp_ahrs);
 
-            // 5. Gia tốc hệ Trái Đất
+            // ACCELERATION TO WORLD FRAME
             float sin_r = sinf(temp_ahrs.roll), cos_r = cosf(temp_ahrs.roll);
             float sin_p = sinf(temp_ahrs.pitch), cos_p = cosf(temp_ahrs.pitch);
             float sin_y = sinf(temp_ahrs.yaw), cos_y = cosf(temp_ahrs.yaw);
@@ -250,18 +240,30 @@ static void mpu6500_read_task(void *pvParameters)
             float ax_world = ax_w_g * GRAVITY_MSS;
             float ay_world = ay_w_g * GRAVITY_MSS;
 
-            // Deadband gia tốc phẳng Tĩnh
             if (fabsf(ax_world) < 0.15f)
                 ax_world = 0.0f;
             if (fabsf(ay_world) < 0.15f)
                 ay_world = 0.0f;
 
-            // 6. Predict EKF 1D & 2D
-            altitude_filter_predict(az_world, dt);
-            flow_filter_predict(ax_world, ay_world, dt);
+            // 2. TÍCH LŨY GIA TỐC VÀ DOWNSAMPLE EKF PREDICT XUỐNG 50Hz (5 VÒNG LẶP = 20ms)
+            az_accum += az_world;
+            ax_accum += ax_world;
+            ay_accum += ay_world;
 
-            // 7. Cập nhật vào s_uav_state (Thread-safe)
-            if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(1)) == pdTRUE)
+            if (++ekf_divider >= 5)
+            {
+                float dt_ekf = dt * 5.0f; // dt 20ms
+                altitude_filter_predict(az_accum / 5.0f, dt_ekf);
+                flow_filter_predict(ax_accum / 5.0f, ay_accum / 5.0f, dt_ekf);
+
+                az_accum = 0.0f;
+                ax_accum = 0.0f;
+                ay_accum = 0.0f;
+                ekf_divider = 0;
+            }
+
+            // GHI DỮ LIỆU ĐÃ CẬP NHẬT
+            if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(2)) == pdTRUE)
             {
                 s_uav_state.roll = temp_ahrs.roll;
                 s_uav_state.pitch = temp_ahrs.pitch;
@@ -277,30 +279,35 @@ static void mpu6500_read_task(void *pvParameters)
                 xSemaphoreGive(s_state_mutex);
             }
         }
-        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(10));
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(4)); // 250Hz (4ms)
     }
 }
-
-// --- TASK MONITOR 20Hz (OPTICAL FLOW + TOF + EKF UPDATE) ---
+// --- TASK MONITOR SENSOR (CORE 0 - 20Hz / OPTICAL FLOW + TOF + EKF UPDATE) ---
 static void sensor_monitor_task(void *pvParameters)
 {
     motionBurst_t pmw_motion = {0};
     uint16_t distance_mm = 0;
-    const float dt_monitor = 0.05f;
 
     flow_filter_init();
     vl53l0xStartContinuous(&s_vl53_dev, 0);
     TickType_t xLastWakeTime = xTaskGetTickCount();
+    int64_t last_time = esp_timer_get_time();
 
     while (1)
     {
+        int64_t now = esp_timer_get_time();
+        float dt_monitor = (float)(now - last_time) / 1000000.0f;
+        last_time = now;
+        if (dt_monitor <= 0.0f || dt_monitor > 0.2f)
+            dt_monitor = 0.05f;
+
         pmw3901ReadMotion(PMW3901_CS_PIN, &pmw_motion);
         distance_mm = vl53l0xReadRangeContinuousMillimeters(&s_vl53_dev);
 
         float current_roll = 0.0f, current_pitch = 0.0f;
         float current_gx = 0.0f, current_gy = 0.0f;
 
-        if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(2)) == pdTRUE)
+        if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(3)) == pdTRUE)
         {
             current_roll = s_uav_state.roll;
             current_pitch = s_uav_state.pitch;
@@ -309,7 +316,6 @@ static void sensor_monitor_task(void *pvParameters)
             xSemaphoreGive(s_state_mutex);
         }
 
-        // Cập nhật Altitude EKF
         if (distance_mm > 20 && distance_mm < 2000)
         {
             float z_raw_m = (float)distance_mm / 1000.0f;
@@ -321,7 +327,6 @@ static void sensor_monitor_task(void *pvParameters)
         float est_vz = altitude_filter_get_vz();
         float z_for_flow = (est_z < 0.05f) ? 0.05f : est_z;
 
-        // Cập nhật 2D Flow EKF
         if (pmw_motion.motionOccured)
         {
             if (abs(pmw_motion.deltaX) < 300 && abs(pmw_motion.deltaY) < 300)
@@ -339,16 +344,15 @@ static void sensor_monitor_task(void *pvParameters)
             }
         }
 
-        // Khóa vận tốc khi nằm trên mặt đất (Zero-Velocity Lock)
         if (est_z < 0.07f)
         {
             flow_filter_zero_velocity();
         }
+
         pos2d_estimate_t pos2d = {0};
         flow_filter_get_estimate(&pos2d);
 
-        // Ghi dữ liệu vị trí 2D và cao độ vào struct tổng
-        if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(2)) == pdTRUE)
+        if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(3)) == pdTRUE)
         {
             s_uav_state.z = est_z;
             s_uav_state.vz = est_vz;
@@ -366,7 +370,7 @@ static void sensor_monitor_task(void *pvParameters)
     }
 }
 
-// --- PUBLIC API IMPLEMENTATION ---
+// --- PUBLIC APIs ---
 
 esp_err_t state_estimator_init(void)
 {
@@ -397,13 +401,13 @@ esp_err_t state_estimator_init(void)
         return ESP_FAIL;
     }
 
-    xTaskCreatePinnedToCore(mpu6500_read_task, "imu_task", 4096, NULL, 10, NULL, 1);
+    // Pinned IMU Task -> CORE 1 (Priority 6), Flow Task -> CORE 0 (Priority 5)
+    xTaskCreatePinnedToCore(mpu6500_read_task, "imu_task", 4096, NULL, 6, NULL, 1);
     xTaskCreatePinnedToCore(sensor_monitor_task, "flow_task", 4096, NULL, 5, NULL, 0);
 
     s_uav_state.is_initialized = true;
     ESP_LOGI(TAG, "State Estimator Module Ready!");
 
-    // Tự động kích hoạt 1 đợt Calib Gyro ngay khi khởi động
     state_estimator_calibrate_gyro();
 
     return ESP_OK;
