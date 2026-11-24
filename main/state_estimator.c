@@ -11,7 +11,7 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "driver/i2c_master.h"
-
+#include "esp_adc/adc_oneshot.h"
 // Hardware Drivers & Filters
 #include "pmw3901.h"
 #include "vl53l0x.h"
@@ -57,6 +57,35 @@ static i2c_master_dev_handle_t s_vl53_dev_handle = NULL;
 spi_device_handle_t pmw3901_spi_handle = NULL;
 static VL53L0xDev s_vl53_dev;
 
+#define VBAT_ADC_CHANNEL ADC_CHANNEL_0 // GPIO 36
+#define VBAT_DIVIDER (43.0f / 33.0f)   // Cầu phân áp 10k/33k
+
+static adc_oneshot_unit_handle_t s_adc_handle = NULL;
+
+void battery_adc_init(void)
+{
+    adc_oneshot_unit_init_cfg_t init_config = {
+        .unit_id = ADC_UNIT_1,
+    };
+    adc_oneshot_new_unit(&init_config, &s_adc_handle);
+
+    adc_oneshot_chan_cfg_t config = {
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+        .atten = ADC_ATTEN_DB_12,
+    };
+    adc_oneshot_config_channel(s_adc_handle, VBAT_ADC_CHANNEL, &config);
+}
+
+float battery_read_voltage(void)
+{
+    int raw = 0;
+    if (s_adc_handle && adc_oneshot_read(s_adc_handle, VBAT_ADC_CHANNEL, &raw) == ESP_OK)
+    {
+        float v_adc = ((float)raw / 4095.0f) * 3.3f;
+        return v_adc * VBAT_DIVIDER;
+    }
+    return 0.0f;
+}
 static void app_spi_init(void)
 {
     spi_bus_config_t buscfg_pmw = {

@@ -151,7 +151,12 @@ static void udp_tx_telemetry_task(void *pvParameters)
         return;
     }
 
-    char tx_buf[128];
+    // BẮT BỘC: Bật SO_BROADCAST để sendto() tới 192.168.4.255 không bị lỗi EACCES (errno 13)
+    int broadcast_enable = 1;
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast_enable, sizeof(broadcast_enable));
+
+    // Tăng kích thước buffer lên 256 byte để tránh tràn chuỗi khi thêm thông số motor
+    char tx_buf[256];
     TickType_t xLastWakeTime = xTaskGetTickCount();
     ESP_LOGI(TAG, "UDP Telemetry Sender active on Port 8889 (Core 0)");
 
@@ -161,17 +166,49 @@ static void udp_tx_telemetry_task(void *pvParameters)
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(50));
 
         uav_state_t current_state;
-        if (state_estimator_get_state(&current_state))
-        {
-            // Định dạng chuỗi Telemetry tương tự hàm state_estimator_stream_telemetry
-            int len = snprintf(tx_buf, sizeof(tx_buf),
-                               "/*%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d*/\n",
-                               current_state.roll_deg, current_state.pitch_deg, current_state.yaw_deg,
-                               current_state.x, current_state.y, current_state.z,
-                               current_state.vx, current_state.vy, current_state.vz,
-                               current_state.squal);
+        float motor_targets[4] = {0}; // M1, M2, M3, M4 (0.0f đến 1.0f)
+        flight_ctrl_debug_t debug = {0};
 
-            if (len > 0)
+        bool state_ok = state_estimator_get_state(&current_state);
+
+        // Lấy công suất 4 động cơ và dữ liệu debug 4 tầng từ flight_control
+        flight_control_get_motors(motor_targets);
+        flight_control_get_debug(&debug);
+
+        if (state_ok)
+        {
+            /*
+             * ĐỊNH DẠNG CHUỖI DEBUG UDP TELEMETRY (24 tham số):
+             * Thái độ gốc (State):     roll, pitch, yaw (deg)
+             * Tầng 1 (Z Pos/Vel):      z_target, z_state, u_z
+             * Tầng 2 (PosHold Vel):    vx_state, vy_state, target_pitch_deg, target_roll_deg
+             * Tầng 3 (Angle):          roll_deg, pitch_deg, target_rate_roll, target_rate_pitch
+             * Tầng 4 (Rate & Torque):  gyro_x, gyro_y, gyro_z, u_roll, u_pitch, u_yaw
+             * Tầng 5 (Motor PWM %):    m1, m2, m3, m4
+             */
+            int len = snprintf(tx_buf, sizeof(tx_buf),
+                               "/*%.2f,%.2f,%.2f,"              // State: Roll, Pitch, Yaw
+                               "%.2f,%.2f,%.2f,"                // T1: z_tgt, z_st, u_z
+                               "%.2f,%.2f,%.1f,%.1f,"           // T2: vx, vy, tgt_pitch, tgt_roll
+                               "%.1f,%.1f,%.1f,%.1f,"           // T3: roll, pitch, tgt_r_roll, tgt_r_pitch
+                               "%.1f,%.1f,%.1f,%.3f,%.3f,%.3f," // T4: gx, gy, gz, u_roll, u_pitch, u_yaw
+                               "%.1f,%.1f,%.1f,%.1f*/\n",       // T5: m1, m2, m3, m4 (%)
+
+                               // Thái độ gốc hiện tại
+                               current_state.roll_deg, current_state.pitch_deg, current_state.yaw_deg,
+                               // Tầng 1
+                               debug.z_target, debug.z_state, debug.u_z,
+                               // Tầng 2
+                               debug.vx_state, debug.vy_state, debug.target_pitch_deg, debug.target_roll_deg,
+                               // Tầng 3
+                               debug.roll_deg, debug.pitch_deg, debug.target_rate_roll, debug.target_rate_pitch,
+                               // Tầng 4
+                               debug.gyro_x, debug.gyro_y, debug.gyro_z, debug.u_roll, debug.u_pitch, debug.u_yaw,
+                               // Tầng 5 (Quy đổi ra 0% -> 100%)
+                               motor_targets[0] * 100.0f, motor_targets[1] * 100.0f,
+                               motor_targets[2] * 100.0f, motor_targets[3] * 100.0f);
+
+            if (len > 0 && len < sizeof(tx_buf))
             {
                 if (s_client_connected)
                 {
@@ -182,7 +219,7 @@ static void udp_tx_telemetry_task(void *pvParameters)
                 }
                 else
                 {
-                    // Nếu chưa nhận được lệnh nào, gửi Broadcast 192.168.4.255
+                    // Gửi Broadcast 192.168.4.255
                     struct sockaddr_in bcast_addr = {
                         .sin_family = AF_INET,
                         .sin_port = htons(8889),
@@ -201,9 +238,8 @@ static void stabilizer_task(void *pvParameters)
 {
     TickType_t xLastWakeTime = xTaskGetTickCount();
     const TickType_t xFrequency = pdMS_TO_TICKS(2); // 2ms = 500Hz chuẩn real-time
-
-    // Khởi tạo phần cứng PWM LEDC và tham số Cascaded PID
     flight_control_init();
+    // Khởi tạo phần cứng PWM LEDC và tham số Cascaded PID
     ESP_LOGI(TAG, "Stabilizer Task active @ 500Hz on Core 1");
 
     uint8_t uart_decimation = 0;
@@ -232,7 +268,7 @@ static void stabilizer_task(void *pvParameters)
 void app_main(void)
 {
     ESP_LOGI(TAG, "=== ESP32 UAV FIRMWARE STARTING ===");
-
+    flight_control_init();
     // 1. Khởi tạo Flash NVS (Bắt buộc cho stack Wi-Fi)
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)

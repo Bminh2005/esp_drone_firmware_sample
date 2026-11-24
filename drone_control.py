@@ -76,24 +76,21 @@ def cmd_disarm():
     g_yaw_rate = 0.0
     print("[DISARM] Đã ngắt toàn bộ động cơ an toàn!")
 
-def cmd_takeoff(target_alt=0.5):
+def cmd_takeoff(target_alt=0.4):
     global g_armed, g_z_target
     if not g_armed:
-        print("[TAKEOFF] Drone chưa ARM! Tự động ARM động cơ trước khi cất cánh...")
+        print("[TAKEOFF] Drone chưa ARM! Tự động ARM động cơ...")
         cmd_arm()
-        time.sleep(0.5)
+        time.sleep(0.3)
 
-    print(f"[TAKEOFF] Đang cất cánh lên độ cao mục tiêu {target_alt:.2f}m...")
-    # Tăng độ cao mượt mà từ 0m lên target_alt trong 2 giây
-    steps = 20
-    current_alt = g_z_target
-    for i in range(1, steps + 1):
-        g_z_target = current_alt + (target_alt - current_alt) * (i / steps)
-        time.sleep(0.1)
-
+    print(f"[TAKEOFF] Bắn thẳng (Pop-Up) lên độ cao {target_alt:.2f}m...")
+    
+    # BẮT BỘC: Đặt thẳng target_alt để PID dồn ga bứt nhanh khỏi sàn nhà trong 0.3s
+    # Tránh bị mắc kẹt tích lũy sai số trong vùng Ground Effect (< 20cm)
     g_z_target = target_alt
-    print(f"[TAKEOFF] Đã đạt độ cao {g_z_target:.2f}m. Đang lơ lửng giữ vị trí (PosHold).")
 
+    print(f"[TAKEOFF] Đã phát lệnh Pop-Up Z = {g_z_target:.2f}m. Đang lơ lửng PosHold.")
+    
 def cmd_land():
     global g_armed, g_z_target, g_vx, g_vy, g_yaw_rate
     if not g_armed or g_z_target <= 0.05:
