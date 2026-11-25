@@ -224,6 +224,22 @@ static void mpu6500_read_task(void *pvParameters)
             }
 
             // BÙ BIAS THÔ VÀ REMAP SANG BODY FRAME
+            // float ax_imu_cal = accel[0] - ACCEL_BIAS_X;
+            // float ay_imu_cal = accel[1] - ACCEL_BIAS_Y;
+            // float az_imu_cal = accel[2] - ACCEL_BIAS_Z;
+
+            // float gx_raw = (gyro[0] * DEG_TO_RAD) - s_gyro_bias_x;
+            // float gy_raw = (gyro[1] * DEG_TO_RAD) - s_gyro_bias_y;
+            // float gz_raw = (gyro[2] * DEG_TO_RAD) - s_gyro_bias_z;
+
+            // float ax_body = ay_imu_cal;
+            // float ay_body = -ax_imu_cal;
+            // float az_body = az_imu_cal;
+
+            // float gx_body = gy_raw;
+            // float gy_body = -gx_raw;
+            // float gz_body = -gz_raw;
+
             float ax_imu_cal = accel[0] - ACCEL_BIAS_X;
             float ay_imu_cal = accel[1] - ACCEL_BIAS_Y;
             float az_imu_cal = accel[2] - ACCEL_BIAS_Z;
@@ -232,12 +248,16 @@ static void mpu6500_read_task(void *pvParameters)
             float gy_raw = (gyro[1] * DEG_TO_RAD) - s_gyro_bias_y;
             float gz_raw = (gyro[2] * DEG_TO_RAD) - s_gyro_bias_z;
 
-            float ax_body = ay_imu_cal;
-            float ay_body = -ax_imu_cal;
-            float az_body = az_imu_cal;
+            // --- Chuyển sang hệ Body FRD (X: Tiến, Y: Phải, Z: Xuống) ---
 
+            // Gia tốc:
+            float ax_body = ay_imu_cal;  // X_body = Forward
+            float ay_body = ax_imu_cal;  // Y_body = Right (đổi dấu từ -ax_imu thành +ax_imu)
+            float az_body = -az_imu_cal; // Z_body = Down  (đổi dấu thành -az_imu)
+
+            // Vận tốc góc (Áp dụng chính xác cùng ma trận xoay):
             float gx_body = gy_raw;
-            float gy_body = -gx_raw;
+            float gy_body = gx_raw; // Đổi dấu từ -gx_raw thành +gx_raw
             float gz_body = -gz_raw;
 
             float gx_mahony = (fabsf(gx_body) < GYRO_DEADBAND_RAD) ? 0.0f : gx_body;
@@ -363,7 +383,7 @@ static void sensor_monitor_task(void *pvParameters)
                 float flow_rad_x = ((float)pmw_motion.deltaX * 0.0024f) / dt_monitor;
                 float flow_rad_y = ((float)pmw_motion.deltaY * 0.0024f) / dt_monitor;
 
-                float flow_trans_x = flow_rad_x - current_gy;
+                float flow_trans_x = flow_rad_x + current_gy;
                 float flow_trans_y = flow_rad_y + current_gx;
 
                 float vx_flow = flow_trans_x * z_for_flow;

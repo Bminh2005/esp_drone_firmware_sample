@@ -229,6 +229,29 @@ static void udp_tx_telemetry_task(void *pvParameters)
                            sizeof(bcast_addr));
                 }
             }
+            // -------------------------------------------------------------
+            // CỔNG 2 (PORT 8890): GỬI BINARY RAW STRUCT uav_state_t
+            // -------------------------------------------------------------
+            if (s_client_connected)
+            {
+                struct sockaddr_in state_client_addr = s_client_telemetry_addr;
+                state_client_addr.sin_port = htons(8890); // Đổi sang Port 8890
+
+                sendto(sock, &current_state, sizeof(uav_state_t), 0,
+                       (struct sockaddr *)&state_client_addr,
+                       sizeof(state_client_addr));
+            }
+            else
+            {
+                struct sockaddr_in state_bcast_addr = {
+                    .sin_family = AF_INET,
+                    .sin_port = htons(8890), // Port 8890 cho State
+                    .sin_addr.s_addr = inet_addr("192.168.4.255")};
+
+                sendto(sock, &current_state, sizeof(uav_state_t), 0,
+                       (struct sockaddr *)&state_bcast_addr,
+                       sizeof(state_bcast_addr));
+            }
         }
     }
 }
@@ -268,7 +291,7 @@ static void stabilizer_task(void *pvParameters)
 void app_main(void)
 {
     ESP_LOGI(TAG, "=== ESP32 UAV FIRMWARE STARTING ===");
-    flight_control_init();
+    // flight_control_init();
     // 1. Khởi tạo Flash NVS (Bắt buộc cho stack Wi-Fi)
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)

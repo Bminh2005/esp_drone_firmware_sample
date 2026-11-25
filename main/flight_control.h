@@ -17,9 +17,9 @@
 #define LEDC_PWM_RES LEDC_TIMER_11_BIT // 11-bit resolution (0 -> 2047)
 
 // --- GIỚI HẠN AN TOÀN PHẦN CỨNG ---
-#define MAX_MOTOR_PWM 0.88f      // Kẹp trần 88% chống sụt áp LDO
-#define MIN_MOTOR_PWM 0.05f      // Xung Idle nhỏ nhất (5%)
-#define MAX_PWM_SLEW_RATE 3.50f  // Giới hạn gia tốc PWM (1/s) chống dòng xả đỉnh
+#define MAX_MOTOR_PWM 0.88f // Kẹp trần 88% chống sụt áp LDO
+#define MIN_MOTOR_PWM 0.05f // Xung Idle nhỏ nhất (5%)
+#define MAX_PWM_SLEW_RATE (8.0f)
 #define UNSTICK_ALTITUDE_M 0.08f // Ngưỡng rời sàn 3cm
 #define FAILSAFE_TIMEOUT_MS 500  // Timeout ngắt UDP (ms)
 
