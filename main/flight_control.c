@@ -139,6 +139,7 @@ static inline float clampf(float val, float min, float max)
 }
 void flight_control_step(const uav_state_t *state, const drone_setpoint_t *setpoint, float dt)
 {
+    // === TELEMETRY LOGGING ===
     s_debug_data.z_target = setpoint->z_target;
     s_debug_data.z_state = state->z;
     s_debug_data.vx_state = state->vx;
@@ -148,11 +149,19 @@ void flight_control_step(const uav_state_t *state, const drone_setpoint_t *setpo
     s_debug_data.gyro_x = state->gyro_x * RAD_TO_DEG;
     s_debug_data.gyro_y = state->gyro_y * RAD_TO_DEG;
     s_debug_data.gyro_z = state->gyro_z * RAD_TO_DEG;
+
+    static float s_ramped_z_target = 0.0f;
+    static float s_filtered_target_pitch = 0.0f;
+    static float s_filtered_target_roll = 0.0f;
+
     // === BẢO VỆ 1: KHI TẮT ĐỘNG CƠ (DISARM) ===
     if (!setpoint->armed)
     {
         s_inverted_timer = 0.0f;
-        // Xóa các giá trị đầu ra điều khiển debug về 0
+        s_ramped_z_target = 0.0f;
+        s_filtered_target_pitch = 0.0f;
+        s_filtered_target_roll = 0.0f;
+
         s_debug_data.u_z = 0.0f;
         s_debug_data.target_pitch_deg = 0.0f;
         s_debug_data.target_roll_deg = 0.0f;
@@ -166,12 +175,12 @@ void flight_control_step(const uav_state_t *state, const drone_setpoint_t *setpo
         return;
     }
 
-    // === BẢO VỆ 2: BẢO VỆ NGỬA BỤNG NGHĨA PHỤC (INVERTED FAILSAFE - 0.3s TIMEOUT) ===
-    float cos_tilt = cosf(state->roll) * cosf(state->pitch);
-    if (cos_tilt < 0.0f) // Góc nghiêng vượt quá 90 độ (bắt đầu lật ngửa)
+    // === BẢO VỆ 2: INVERTED FAILSAFE (TÍNH THEO RADIAN ĐỒNG BỘ) ===
+    float cos_tilt = cosf(state->roll_deg * DEG_TO_RAD) * cosf(state->pitch_deg * DEG_TO_RAD);
+    if (cos_tilt < 0.0f) // Nghiêng vượt 90 độ
     {
         s_inverted_timer += dt;
-        if (s_inverted_timer > 0.3f) // Ngắt khẩn cấp sau 0.3 giây
+        if (s_inverted_timer > 0.3f)
         {
             ESP_LOGE(TAG, "Inverted Failsafe Triggered! Tilt > 90deg. Disarming.");
             flight_control_disarm_motors();
@@ -183,11 +192,15 @@ void flight_control_step(const uav_state_t *state, const drone_setpoint_t *setpo
         s_inverted_timer = 0.0f;
     }
 
-    // === BẢO VỆ 3: XẢ TÍCH PHÂN I-TERM KHI NẰM TRÊN SÀN ===
-    if (state->z < UNSTICK_ALTITUDE_M || setpoint->z_target <= 0.01f)
+    // === BẢO VỆ 3: RESET I-TERM KHI NẰM SÀN (TÁCH BIỆT CAO ĐỘ VÀ OPTICAL FLOW) ===
+    if (setpoint->z_target <= 0.01f)
     {
         pid_reset(&pid_alt_pos);
         pid_reset(&pid_alt_vel);
+    }
+
+    if (state->z < UNSTICK_ALTITUDE_M)
+    {
         pid_reset(&pid_vel_x);
         pid_reset(&pid_vel_y);
         pid_reset(&pid_angle_roll);
@@ -197,210 +210,91 @@ void flight_control_step(const uav_state_t *state, const drone_setpoint_t *setpo
         pid_reset(&pid_rate_yaw);
     }
 
-    // // --- TẦNG 1: CAO ĐỘ (ALTITUDE POS -> VEL -> THRUST) ---
-    // float z_error = setpoint->z_target - state->z;
-    // float vz_target = pid_alt_pos.kp * z_error;
-    // if (vz_target > pid_alt_pos.out_max)
-    //     vz_target = pid_alt_pos.out_max;
-    // if (vz_target < -pid_alt_pos.out_max)
-    //     vz_target = -pid_alt_pos.out_max;
+    // === TẦNG 1: ALTITUDE CONTROL (ĐÃ PHỤC HỒI RAMPING THỜI GIAN THỰC) ===
+    if (setpoint->z_target > 0.01f)
+    {
+        if (s_ramped_z_target < setpoint->z_target)
+        {
+            s_ramped_z_target += 0.30f * dt; // Tăng 30cm/s khi cất cánh
+            if (s_ramped_z_target > setpoint->z_target)
+                s_ramped_z_target = setpoint->z_target;
+        }
+        else if (s_ramped_z_target > setpoint->z_target)
+        {
+            s_ramped_z_target -= 0.40f * dt; // Hạ 40cm/s khi hạ cánh
+            if (s_ramped_z_target < setpoint->z_target)
+                s_ramped_z_target = setpoint->z_target;
+        }
+    }
+    else
+    {
+        s_ramped_z_target = 0.0f;
+    }
 
-    // float thrust_offset = pid_compute(&pid_alt_vel, vz_target, state->vz, dt);
-
-    // // Đảm bảo thrust_offset không làm vọt ga nền quá mức (+/- 12% PWM max)
-    // if (thrust_offset > 0.12f)
-    //     thrust_offset = 0.12f;
-    // if (thrust_offset < -0.12f)
-    //     thrust_offset = -0.12f;
-
-    // float target_thrust = 0.08f; // Ga Idle 8% khi ở mặt đất
-
-    // if (setpoint->z_target > 0.01f)
-    // {
-    //     target_thrust = HOVER_BASE_THRUST + thrust_offset;
-    //     // Giới hạn ga nền tối đa 75% để luôn dành 25% headroom cho Roll/Pitch
-    //     if (target_thrust > 0.75f)
-    //         target_thrust = 0.75f;
-    // }
-
-    // // =========================================================================
-    // // --- TẦNG 1: CAO ĐỘ (ALTITUDE POS -> VEL -> THRUST) [OPTIMIZED] ---
-    // // =========================================================================
-
-    // // 1. Ramp z_target để cất/hạ cánh từ từ, triệt tiêu xung ga dội sàn (Ground Effect)
-    // static float s_ramped_z_target = 0.0f;
-
-    // if (setpoint->armed && setpoint->z_target > 0.01f)
-    // {
-    //     if (s_ramped_z_target < setpoint->z_target)
-    //     {
-    //         s_ramped_z_target += 0.30f * dt; // Tăng dần 30cm/s khi cất cánh
-    //         if (s_ramped_z_target > setpoint->z_target)
-    //             s_ramped_z_target = setpoint->z_target;
-    //     }
-    //     else if (s_ramped_z_target > setpoint->z_target)
-    //     {
-    //         s_ramped_z_target -= 0.40f * dt; // Hạ dần 40cm/s khi hạ cánh
-    //         if (s_ramped_z_target < setpoint->z_target)
-    //             s_ramped_z_target = setpoint->z_target;
-    //     }
-    // }
-    // else
-    // {
-    //     s_ramped_z_target = 0.0f;
-    // }
-
-    // float target_thrust = 0.0f;
-
-    // if (setpoint->armed)
-    // {
-    //     if (s_ramped_z_target > 0.01f)
-    //     {
-    //         // P-Control: Tính vận tốc Z mục tiêu từ sai số cao độ đã Ramp
-    //         float z_error = s_ramped_z_target - state->z;
-    //         float vz_target = clampf(pid_alt_pos.kp * z_error, -pid_alt_pos.out_max, pid_alt_pos.out_max);
-
-    //         // PID Control: Tính Thrust Offset bù ga
-    //         float thrust_offset = pid_compute(&pid_alt_vel, vz_target, state->vz, dt);
-
-    //         // Mở rộng giới hạn bù ga lên +/- 0.20 (20%) để thích ứng khi sụt áp pin LiPo 1S
-    //         thrust_offset = clampf(thrust_offset, -0.20f, 0.20f);
-
-    //         // Tính ga nền cơ bản
-    //         target_thrust = HOVER_BASE_THRUST + thrust_offset;
-
-    //         // 2. BÙ GÓC NGHIÊNG (Attitude Tilt Compensation)
-    //         // Khi drone nghiêng Roll/Pitch để hãm trôi, lực nâng theo phương đứng bị giảm theo cos(theta).
-    //         // Phép chia này giúp giữ nguyên độ cao Z ngay cả khi PosHold làm drone nghiêng gắt.
-    //         float cos_roll = cosf(state->roll_deg * DEG_TO_RAD);
-    //         float cos_pitch = cosf(state->pitch_deg * DEG_TO_RAD);
-    //         float tilt_comp = cos_roll * cos_pitch;
-
-    //         // Kẹp giới hạn cos_tilt >= 0.707 (tương đương nghiêng max 45 deg) để tránh chia cho 0
-    //         if (tilt_comp < 0.707f)
-    //             tilt_comp = 0.707f;
-    //         target_thrust /= tilt_comp;
-
-    //         if (target_thrust > 0.60f)
-    //         {
-    //             target_thrust = 0.60f;
-    //         }
-
-    //         // -----------------------------------------------------------------
-    //         // CHÈN MỤC 1 Ở ĐÂY: KHÓA GA & RESET PID KHI CÒN TRÊN SÀN (Z < 0.05m)
-    //         // -----------------------------------------------------------------
-    //         if (state->z < 0.05f)
-    //         {
-    //             // Khống chế ga nền tối đa 25% khi sát đất để không bị bão hòa ga
-    //             if (target_thrust > 0.25f)
-    //             {
-    //                 target_thrust = 0.25f;
-    //             }
-
-    //             // Reset I-term các tầng góc nghiêng để không bị tích lũy lực bật ảo trên sàn
-    //             pid_reset(&pid_angle_roll);
-    //             pid_reset(&pid_angle_pitch);
-    //             pid_reset(&pid_rate_roll);
-    //             pid_reset(&pid_rate_pitch);
-    //         }
-    //         // Giới hạn ga nền trong khoảng [5% - 75%] để luôn dành 25% Headroom cho Roll/Pitch/Yaw
-    //         target_thrust = clampf(target_thrust, 0.05f, 0.6f);
-    //     }
-    //     else
-    //     {
-    //         // Khi Armed nhưng chưa cất cánh (z_target = 0): Chạy ga Idle và Reset PID
-    //         pid_reset(&pid_alt_vel);
-    //         target_thrust = 0.06f; // 6% PWM quay nhẹ cánh báo hiệu sẵn sàng
-    //     }
-    // }
-    // else
-    // {
-    //     // Disarmed -> Ngắt hoàn toàn ga và xóa tích lũy I-term
-    //     pid_reset(&pid_alt_vel);
-    //     target_thrust = 0.0f;
-    // }
-
-    // =========================================================================
-    // TẦNG 1: CAO ĐỘ (ALTITUDE POS -> VEL -> THRUST)
-    // =========================================================================
-    static float s_ramped_z_target = 0.0f;
     float target_thrust = 0.0f;
 
-    if (setpoint->armed)
+    if (s_ramped_z_target > 0.01f)
     {
-        if (s_ramped_z_target > 0.01f)
+        float z_error = s_ramped_z_target - state->z;
+        float vz_target = clampf(pid_alt_pos.kp * z_error, -pid_alt_pos.out_max, pid_alt_pos.out_max);
+        float thrust_offset = pid_compute(&pid_alt_vel, vz_target, state->vz, dt);
+        thrust_offset = clampf(thrust_offset, -0.20f, 0.20f);
+
+        target_thrust = HOVER_BASE_THRUST + thrust_offset;
+
+        // Bù góc nghiêng (Tilt Compensation)
+        float cos_roll = cosf(state->roll_deg * DEG_TO_RAD);
+        float cos_pitch = cosf(state->pitch_deg * DEG_TO_RAD);
+        float tilt_comp = cos_roll * cos_pitch;
+        if (tilt_comp < 0.707f)
+            tilt_comp = 0.707f;
+        target_thrust /= tilt_comp;
+
+        target_thrust = clampf(target_thrust, 0.05f, 0.60f);
+
+        // Khóa ga nền & Reset I-term khi rất sát đất (Z < 0.05m)
+        if (state->z < 0.05f)
         {
-            float z_error = s_ramped_z_target - state->z;
-            float vz_target = clampf(pid_alt_pos.kp * z_error, -pid_alt_pos.out_max, pid_alt_pos.out_max);
-            float thrust_offset = pid_compute(&pid_alt_vel, vz_target, state->vz, dt);
-            thrust_offset = clampf(thrust_offset, -0.20f, 0.20f);
-
-            target_thrust = HOVER_BASE_THRUST + thrust_offset;
-
-            // 1. Bù góc nghiêng (Tilt Compensation)
-            float cos_roll = cosf(state->roll_deg * DEG_TO_RAD);
-            float cos_pitch = cosf(state->pitch_deg * DEG_TO_RAD);
-            float tilt_comp = cos_roll * cos_pitch;
-            if (tilt_comp < 0.707f)
-                tilt_comp = 0.707f;
-            target_thrust /= tilt_comp;
-
-            // 2. Kẹp an toàn dải ga bay [5% - 60%] (Dành 40% Headroom cho Roll/Pitch)
-            target_thrust = clampf(target_thrust, 0.05f, 0.60f);
-
-            // 3. Khóa ga nền & Reset I-term khi drone còn nằm sát sàn (Z < 0.05m)
-            if (state->z < 0.05f)
+            if (target_thrust > 0.25f)
             {
-                // Ép ga nền tối đa 25% sát mặt đất để không bị nạp vọt ga dội sàn
-                if (target_thrust > 0.25f)
-                {
-                    target_thrust = 0.25f;
-                }
-
-                // Reset I-term các tầng góc nghiêng tránh tích lũy lực bật ảo trên sàn
-                pid_reset(&pid_angle_roll);
-                pid_reset(&pid_angle_pitch);
-                pid_reset(&pid_rate_roll);
-                pid_reset(&pid_rate_pitch);
+                target_thrust = 0.25f;
             }
-        }
-        else
-        {
-            pid_reset(&pid_alt_vel);
-            target_thrust = 0.06f; // Ga Idle 6% khi nằm sàn
+            pid_reset(&pid_angle_roll);
+            pid_reset(&pid_angle_pitch);
+            pid_reset(&pid_rate_roll);
+            pid_reset(&pid_rate_pitch);
         }
     }
     else
     {
         pid_reset(&pid_alt_vel);
-        target_thrust = 0.0f; // Disarmed -> Tắt hoàn toàn ga
+        target_thrust = 0.06f; // Ga Idle 6% khi ở mặt đất
     }
-    // --- TẦNG 2: POSHOLD OPTICAL FLOW ---
+
+    // === TẦNG 2: POSHOLD OPTICAL FLOW ===
     float target_pitch_deg = 0.0f;
     float target_roll_deg = 0.0f;
 
     if (state->z > UNSTICK_ALTITUDE_M)
     {
-        target_pitch_deg = -pid_compute(&pid_vel_x, setpoint->vx_target, state->vx, dt);
-        target_roll_deg = -pid_compute(&pid_vel_y, setpoint->vy_target, state->vy, dt);
+        target_pitch_deg = pid_compute(&pid_vel_x, setpoint->vx_target, state->vx, dt);
+        target_roll_deg = pid_compute(&pid_vel_y, setpoint->vy_target, state->vy, dt);
     }
     else
     {
         pid_reset(&pid_vel_x);
         pid_reset(&pid_vel_y);
     }
-    static float s_filtered_target_pitch = 0.0f;
-    static float s_filtered_target_roll = 0.0f;
+
     s_filtered_target_pitch += 0.15f * (target_pitch_deg - s_filtered_target_pitch);
     s_filtered_target_roll += 0.15f * (target_roll_deg - s_filtered_target_roll);
-    // --- TẦNG 3: ATTITUDE ANGLE PID ---
-    // float target_rate_roll = pid_compute(&pid_angle_roll, target_roll_deg, state->roll_deg, dt);
-    // float target_rate_pitch = pid_compute(&pid_angle_pitch, target_pitch_deg, state->pitch_deg, dt);
+
+    // === TẦNG 3: ATTITUDE ANGLE PID ===
     float target_rate_roll = pid_compute(&pid_angle_roll, s_filtered_target_roll, state->roll_deg, dt);
     float target_rate_pitch = pid_compute(&pid_angle_pitch, s_filtered_target_pitch, state->pitch_deg, dt);
     float target_rate_yaw = setpoint->yaw_rate_target;
 
-    // --- TẦNG 4: ATTITUDE RATE PID ---
+    // === TẦNG 4: ATTITUDE RATE PID ===
     float roll_rate_deg = state->gyro_x * RAD_TO_DEG;
     float pitch_rate_deg = state->gyro_y * RAD_TO_DEG;
     float yaw_rate_deg = state->gyro_z * RAD_TO_DEG;
@@ -409,32 +303,23 @@ void flight_control_step(const uav_state_t *state, const drone_setpoint_t *setpo
     float u_pitch = pid_compute(&pid_rate_pitch, target_rate_pitch, pitch_rate_deg, dt);
     float u_yaw = pid_compute(&pid_rate_yaw, target_rate_yaw, yaw_rate_deg, dt);
 
-    // KẸP BIÊN U_YAW: Không cho phép Yaw chiếm quá 10% công suất Motor
-    if (u_yaw > 0.10f)
-        u_yaw = 0.10f;
-    if (u_yaw < -0.10f)
-        u_yaw = -0.10f;
+    u_yaw = clampf(u_yaw, -0.10f, 0.10f);
 
-    // --- TẦNG 5: MOTOR MIXER MATRIX ---
+    // === TẦNG 5: MOTOR MIXER MATRIX ===
     float motor_targets[4];
-    motor_targets[0] = target_thrust - u_pitch - u_roll + u_yaw; // M1 CCW
-    motor_targets[1] = target_thrust + u_pitch - u_roll - u_yaw; // M2 CW
-    motor_targets[2] = target_thrust + u_pitch + u_roll + u_yaw; // M3 CCW
-    motor_targets[3] = target_thrust - u_pitch + u_roll - u_yaw; // M4 CW
+    motor_targets[0] = target_thrust - u_pitch - u_roll + u_yaw; // M1 CCW (Front-Right)
+    motor_targets[1] = target_thrust + u_pitch - u_roll - u_yaw; // M2 CW  (Rear-Right)
+    motor_targets[2] = target_thrust + u_pitch + u_roll + u_yaw; // M3 CCW (Rear-Left)
+    motor_targets[3] = target_thrust - u_pitch + u_roll - u_yaw; // M4 CW  (Front-Left)
 
-    // === THUẬT TOÁN CHỐNG BÃO HÒA MIXER (MOTOR DESATURATION) ===
-    // Tìm motor có công suất lớn nhất và nhỏ nhất
+    // === CHỐNG BÃO HÒA MIXER (MOTOR DESATURATION) ===
     float max_motor = motor_targets[0];
-    float min_motor = motor_targets[0];
     for (int i = 1; i < 4; i++)
     {
         if (motor_targets[i] > max_motor)
             max_motor = motor_targets[i];
-        if (motor_targets[i] < min_motor)
-            min_motor = motor_targets[i];
     }
 
-    // Trường hợp 1: Có motor vượt trần MAX_MOTOR_PWM -> Hạ toàn bộ Mixer xuống
     if (max_motor > MAX_MOTOR_PWM)
     {
         float excess = max_motor - MAX_MOTOR_PWM;
@@ -443,35 +328,18 @@ void flight_control_step(const uav_state_t *state, const drone_setpoint_t *setpo
             motor_targets[i] -= excess;
         }
     }
-    // Trường hợp 2: Có motor tụt dưới MIN_MOTOR_PWM -> Nâng toàn bộ Mixer lên
-    else if (min_motor < MIN_MOTOR_PWM)
-    {
-        float deficit = MIN_MOTOR_PWM - min_motor;
-        for (int i = 0; i < 4; i++)
-        {
-            motor_targets[i] += deficit;
-        }
-    }
 
-    // Ép biên an toàn tuyệt đối
+    // === CHỐT VÀ XUẤT XUNG PHẦN CỨNG LEDC PWM (ĐÃ PHỤC HỒI) ===
     for (int i = 0; i < 4; i++)
     {
-        if (motor_targets[i] > MAX_MOTOR_PWM)
-            motor_targets[i] = MAX_MOTOR_PWM;
-        if (motor_targets[i] < MIN_MOTOR_PWM)
-            motor_targets[i] = MIN_MOTOR_PWM;
+        motor_targets[i] = clampf(motor_targets[i], MIN_MOTOR_PWM, MAX_MOTOR_PWM);
 
-        // Limiter gia tốc PWM chống sụt áp LDO
+        // Limiter gia tốc PWM chống sụt áp LDO/Pin
         float max_step = MAX_PWM_SLEW_RATE * dt;
         float diff = motor_targets[i] - s_motor_pwm[i];
-        if (diff > max_step)
-            diff = max_step;
-        if (diff < -max_step)
-            diff = -max_step;
+        diff = clampf(diff, -max_step, max_step);
 
         s_motor_pwm[i] += diff;
-
-        // Ghi lại giá trị thực tế sau khi Desaturation vào biến debug/log
         s_current_motor_targets[i] = s_motor_pwm[i];
 
         uint32_t duty = (uint32_t)(s_motor_pwm[i] * 2047.0f);
